@@ -1,10 +1,10 @@
-name: publish-component
+name: publish-launcher
 
 on:
   workflow_dispatch:
     inputs:
       sdk_ref:
-        description: SDK source commit containing component publication contracts
+        description: SDK source commit containing application publication contracts
         required: true
         type: string
 
@@ -32,6 +32,6 @@ jobs:
       - run: pixi run --locked --manifest-path .ci/pixi.toml publish
       - uses: actions/upload-artifact@v4
         with:
-          name: component-${{ matrix.os }}
+          name: launcher-${{ matrix.os }}
           path: dist/*
           if-no-files-found: error

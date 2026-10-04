@@ -13,7 +13,7 @@ from .api import access_token, create_app
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Manage Feel8 components independently of WebStudio.')
+    parser = argparse.ArgumentParser(description='Manage Feel8 applications independently of WebStudio.')
     parser.add_argument('--data-dir', type=Path, default=Path(os.environ.get('F8_PLATFORM_DATA_ROOT', str(Path.home() / '.feel8'))))
     parser.add_argument('--port', type=int, default=8209)
     commands = parser.add_subparsers(dest='action', required=True)
@@ -27,13 +27,13 @@ def main() -> None:
     importer.add_argument('--sha256', required=True)
     for action in ('prepare', 'select', 'update', 'uninstall'):
         command = commands.add_parser(action)
-        command.add_argument('component_id')
+        command.add_argument('extension_id')
         command.add_argument('--sha256', required=True)
     for action in ('start', 'stop'):
         command = commands.add_parser(action)
-        command.add_argument('component_id')
+        command.add_argument('extension_id')
     configuration = commands.add_parser('configure')
-    configuration.add_argument('component_id')
+    configuration.add_argument('extension_id')
     configuration.add_argument('--endpoint', action='append', required=True, help='NAME=loopback HTTP URL')
     args = parser.parse_args()
     if not 0 < args.port < 65536:
@@ -46,16 +46,16 @@ def main() -> None:
     with httpx.Client(base_url=f'http://127.0.0.1:{args.port}', headers={'Authorization': f'Bearer {token}'},
                       timeout=None, trust_env=False) as client:
         if args.action == 'list':
-            response = client.get('/api/components')
+            response = client.get('/api/applications')
         elif args.action == 'import':
-            response = client.post('/api/components/import', json={'location': args.location, 'sha256': args.sha256})
+            response = client.post('/api/applications/import', json={'location': args.location, 'sha256': args.sha256})
         elif args.action == 'configure':
             endpoints = dict(item.split('=', 1) for item in args.endpoint)
-            response = client.post(f'/api/components/{args.component_id}/configure', json={'endpoints': endpoints})
+            response = client.post(f'/api/applications/{args.extension_id}/configure', json={'endpoints': endpoints})
         elif args.action in {'prepare', 'select', 'update', 'uninstall'}:
-            response = client.post(f'/api/components/{args.component_id}/{args.action}', json={'sha256': args.sha256})
+            response = client.post(f'/api/applications/{args.extension_id}/{args.action}', json={'sha256': args.sha256})
         else:
-            response = client.post(f'/api/components/{args.component_id}/{args.action}')
+            response = client.post(f'/api/applications/{args.extension_id}/{args.action}')
         response.raise_for_status()
         if response.content:
             print(json.dumps(response.json(), indent=2, ensure_ascii=False))

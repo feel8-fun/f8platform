@@ -1,10 +1,10 @@
 # Development and publication
 
-Prepare `.sdk` as a checkout of `feel8-fun/f8sdk` at a reviewed component-capable
-commit. Inside the distribution checkout, run:
+Prepare `.sdk` as a checkout of `feel8-fun/f8sdk` at a reviewed application-capable
+commit. Inside the development workspace checkout, run:
 
 ```sh
-pixi run -e build-check python scripts/component_workspace.py prepare
+pixi run -e build-check python scripts/workspace_inputs.py prepare
 ```
 
 Build dependencies live in `.ci/pixi.toml` and `.ci/pixi.lock`. Runtime dependencies
@@ -25,5 +25,5 @@ workflow with reviewed dependency commits; it uploads artifacts, not a remote re
 Run the headless manager using `pixi run -e platform-runtime python -m f8platform
 --data-dir <absolute-path> serve`. Other terminal sessions can use `list`, `import`,
 `prepare`, `select`, `configure`, `start`, `stop`, `update`, and `uninstall` with the
-same data directory. Updating a running component requires its consumers to stop;
+same data directory. Updating a running application requires its consumers to stop;
 a failed readiness check restores the previous selection and restarts its old release.

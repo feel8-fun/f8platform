@@ -292,7 +292,7 @@ class ExtensionManager:
         for manifest in catalog.extensions:
             if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}', manifest.extension_id):
                 raise ValueError(f'Invalid extension ID: {manifest.extension_id!r}')
-            if manifest.extension_id in ids or not manifest.version or not (manifest.service_classes or manifest.tools or manifest.skills or manifest.resources):
+            if manifest.extension_id in ids or not manifest.version or not (manifest.service_classes or manifest.tools or manifest.skills or manifest.resources or manifest.application is not None):
                 raise ValueError(f'Duplicate or invalid extension: {manifest.extension_id}')
             ids.add(manifest.extension_id)
             validate_capabilities(manifest, ServicePaths.for_index(root / 'config/service-index.json'))

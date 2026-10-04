@@ -1,6 +1,7 @@
 # f8platform
 
-Independently versioned Feel8 component. This repository owns its runtime
+Independent Feel8 launcher and lifecycle manager. It is bootstrap infrastructure,
+not an extension. This repository owns its runtime
 `pixi.toml`/`pixi.lock`, implementation, build inputs and publisher workflow.
 Official code retains AGPL-3.0/commercial licensing; SDK dependencies use their own license.
 
