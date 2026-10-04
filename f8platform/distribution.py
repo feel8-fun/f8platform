@@ -48,8 +48,8 @@ async def install_distribution(manager: ComponentManager, source: Path) -> tuple
             if hashlib.file_digest(handle, 'sha256').hexdigest() != item.sha256:
                 raise InvalidRequestError('Bundled component checksum mismatch')
         record = await manager.import_archive(str(archive.resolve()), item.sha256)
-        await manager.prepare(record.component_id, record.sha256)
-        selected[record.component_id] = record.sha256
+        selected.setdefault(record.component_id, record.sha256)
+        await manager.prepare(record.component_id, selected[record.component_id])
     manager.validate_selection(selected)
     if set(catalog.startup) - selected.keys():
         raise InvalidRequestError('Distribution startup component is missing')

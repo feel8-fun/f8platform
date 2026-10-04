@@ -252,3 +252,29 @@ def test_only_one_platform_owns_data_directory(tmp_path: Path) -> None:
                 pytest.fail('second owner acquired the same platform data')
     with single_platform_instance(tmp_path):
         pass
+
+
+def test_reopening_distribution_preserves_user_selected_upgrade(tmp_path: Path) -> None:
+    from f8platform.distribution import install_distribution
+    from f8pysdk.component_spec import ComponentCatalog, BundledComponent
+    import shutil
+    async def run() -> None:
+        manager = ComponentManager(tmp_path / 'data')
+        old_path, old_digest = artifact(tmp_path, 'provider', version='1.0')
+        new_path, new_digest = artifact(tmp_path, 'provider', version='1.1')
+        await manager.import_archive(str(new_path.resolve()), new_digest)
+        await manager.select('provider', new_digest)
+        source = tmp_path / 'distribution'
+        (source / 'config').mkdir(parents=True)
+        (source / 'component-archives').mkdir()
+        payload = source / 'component-packages' / old_digest
+        shutil.copytree(tmp_path / 'provider-1.0', payload)
+        shutil.copy2(old_path, source / 'component-archives' / f'{old_digest}.zip')
+        (source / 'config/component-packages.json').write_bytes(msgspec.json.encode(ComponentCatalog(
+            schema_version='f8componentCatalog/1', components=(BundledComponent(
+                path='${F8_PACKAGE_ROOT}/component-packages/' + old_digest, sha256=old_digest),))))
+        (source / 'config/service-index.json').write_text('{"schemaVersion":"f8serviceIndex/1","services":[]}')
+        with patch.object(ComponentManager, 'prepare'):
+            await install_distribution(manager, source)
+        assert manager.state.selected['provider'] == new_digest
+    asyncio.run(run())
