@@ -24,6 +24,7 @@ from f8pysdk.component_package import validate_component
 from f8pysdk.component_spec import ComponentManifest, ComponentEndpoint
 from f8pysdk.extension_spec import ExtensionManifest, ExtensionRuntime
 from f8pysdk.release_spec import PublishedArtifact
+from f8pysdk.specs import F8JsonValue
 
 from .environments import EnvironmentManager
 from .errors import ConflictError, InvalidRequestError, NotFoundError, ServiceUnavailableError
@@ -68,10 +69,11 @@ class ComponentManager:
         self.root.mkdir(parents=True, exist_ok=True)
         config = self.data_dir / 'distribution/config'
         config.mkdir(parents=True, exist_ok=True)
-        for filename, content in (
+        catalogs: tuple[tuple[str, dict[str, F8JsonValue]], ...] = (
             ('service-index.json', {'schemaVersion': 'f8serviceIndex/1', 'services': [], 'modelRoot': '${F8_MODEL_ROOT}'}),
             ('extensions.json', {'schemaVersion': 'f8extensionCatalog/1', 'extensions': [], 'preinstalled': []}),
-        ):
+        )
+        for filename, content in catalogs:
             path = config / filename
             if not path.exists():
                 try:
