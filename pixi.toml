@@ -1,0 +1,18 @@
+[workspace]
+name = "f8platform"
+channels = ["conda-forge"]
+platforms = ["linux-64", "win-64"]
+
+[dependencies]
+python = ">=3.14,<3.15"
+pip = ">=26,<27"
+
+[pypi-dependencies]
+f8platform = {path = ".", editable = true}
+f8pysdk = {path = ".sdk/python", editable = true}
+
+[tasks]
+serve = "python -m f8platform serve"
+
+[environments]
+platform-runtime = []

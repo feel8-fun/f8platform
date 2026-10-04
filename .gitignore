@@ -1,0 +1,12 @@
+.sdk
+.pixi/
+build/
+dist/
+__pycache__/
+*.pyc
+*.egg-info/
+node_modules/
+*.tsbuildinfo
+.pytest_cache/
+.ruff_cache/
+f8studio_server/f8studio_server/web_dist/
