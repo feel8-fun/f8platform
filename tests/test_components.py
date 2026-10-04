@@ -278,3 +278,15 @@ def test_reopening_distribution_preserves_user_selected_upgrade(tmp_path: Path) 
             await install_distribution(manager, source)
         assert manager.state.selected['provider'] == new_digest
     asyncio.run(run())
+
+
+def test_standalone_platform_initializes_catalog_and_shared_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from f8platform.extensions import ExtensionManager
+    manager = ComponentManager(tmp_path / 'data')
+    index = manager.data_dir / 'distribution/config/service-index.json'
+    assert index.is_file()
+    monkeypatch.setenv('F8_RUNTIME_STORAGE_ROOT', str(manager.data_dir))
+    extensions = ExtensionManager(manager.data_dir / 'studio', base_index=index)
+    assert extensions.statuses() == ()
+    assert extensions.environments.root == manager.data_dir / 'runtimes'
+    assert extensions.environments.install_environment()['PIXI_CACHE_DIR'] == str(manager.data_dir / 'package-cache')

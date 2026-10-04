@@ -31,7 +31,10 @@ class EnvironmentManager:
                  dependency_root: Path | None = None, development_root: Path | None = None) -> None:
         storage_file = data_dir / 'runtime-storage.json'
         storage = msgspec.json.decode(storage_file.read_bytes(), type=dict[str, str]) if storage_file.is_file() else {}
-        self.root = Path(storage.get('path', str(data_dir))).resolve() / 'runtimes'
+        configured_root = os.environ.get('F8_RUNTIME_STORAGE_ROOT')
+        if configured_root and not Path(configured_root).is_absolute():
+            raise InvalidRequestError('F8_RUNTIME_STORAGE_ROOT must be absolute')
+        self.root = Path(storage.get('path', configured_root or str(data_dir))).resolve() / 'runtimes'
         self._source_root = source_root
         self.dependency_root = dependency_root or source_root
         self._development_root = development_root

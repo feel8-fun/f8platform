@@ -66,6 +66,19 @@ class ComponentManager:
         self.data_dir = data_dir.resolve()
         self.root = self.data_dir / 'components'
         self.root.mkdir(parents=True, exist_ok=True)
+        config = self.data_dir / 'distribution/config'
+        config.mkdir(parents=True, exist_ok=True)
+        for filename, content in (
+            ('service-index.json', {'schemaVersion': 'f8serviceIndex/1', 'services': [], 'modelRoot': '${F8_MODEL_ROOT}'}),
+            ('extensions.json', {'schemaVersion': 'f8extensionCatalog/1', 'extensions': [], 'preinstalled': []}),
+        ):
+            path = config / filename
+            if not path.exists():
+                try:
+                    with path.open('xb') as handle:
+                        handle.write(msgspec.json.encode(content))
+                except FileExistsError:
+                    logger.debug('Deployment catalog already initialized: %s', path, exc_info=True)
         self.state_path = self.root / 'state.json'
         self.state = (msgspec.json.decode(self.state_path.read_bytes(), type=ComponentState)
                       if self.state_path.is_file() else ComponentState())
@@ -347,6 +360,7 @@ class ComponentManager:
                 stdout=log, stderr=log,
                 env={**manager.install_environment(), 'F8_DATA_ROOT': str(self.data_dir),
                      'F8_COMPONENT_ROOT': str(self._payload(record.sha256)), 'F8_COMPONENT_INSTANCE': instance,
+                     'F8_RUNTIME_STORAGE_ROOT': str(self.data_dir),
                      'F8_SERVICE_INDEX': str(self.data_dir / 'distribution/config/service-index.json'),
                      **dict(zip(manifest.launch.env, self._expand(manifest, self._payload(record.sha256),
                                                                  tuple(manifest.launch.env.values())), strict=True))},
