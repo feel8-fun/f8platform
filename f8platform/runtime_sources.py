@@ -14,8 +14,8 @@ from .environment_definitions import JsonObject, read_manifest, selected_lock, s
 from .errors import InvalidRequestError
 
 
-def read_runtime_catalog(root: Path) -> RuntimeCatalog:
-    path = root / 'config/runtime-environments.json'
+def read_runtime_catalog(root: Path, *, catalog_path: Path | None = None) -> RuntimeCatalog:
+    path = catalog_path or root / 'config/runtime-environments.json'
     if not path.is_file():
         return RuntimeCatalog(schema_version='f8runtimeCatalog/1', runtimes=())
     catalog = msgspec.json.decode(path.read_bytes(), type=RuntimeCatalog)
@@ -31,11 +31,11 @@ def read_runtime_catalog(root: Path) -> RuntimeCatalog:
     return catalog
 
 
-def read_runtime_sources(root: Path) -> dict[str, tuple[Path, str | None]]:
-    path = root / 'config/runtime-environments.json'
+def read_runtime_sources(root: Path, *, catalog_path: Path | None = None) -> dict[str, tuple[Path, str | None]]:
+    path = catalog_path or root / 'config/runtime-environments.json'
     if not path.is_file():
         return {}
-    catalog = read_runtime_catalog(root)
+    catalog = read_runtime_catalog(root, catalog_path=path)
     if catalog.schema_version != 'f8runtimeCatalog/1':
         raise InvalidRequestError(f'Unsupported runtime catalog: {catalog.schema_version}')
     sources: dict[str, tuple[Path, str | None]] = {}

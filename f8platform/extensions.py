@@ -97,8 +97,12 @@ class ExtensionManager:
         self._root = data_dir / 'extensions'
         self._data_dir = data_dir
         self._base_index = (base_index or default_service_index()).resolve()
-        self._source_root = self._base_index.parent.parent
-        self.environments = EnvironmentManager(data_dir, self._source_root)
+        base = (read_service_index(self._base_index) if self._base_index.is_file() else
+                ServiceIndex(schemaVersion='f8serviceIndex/1', services=(), modelRoot='${F8_MODEL_ROOT}'))
+        self._source_root = index_paths(self._base_index, base).package_root
+        self.environments = EnvironmentManager(
+            data_dir, self._source_root, runtime_catalog_path=self._base_index.with_name('runtime-environments.json'),
+        )
         self._tool_running: Callable[[str], bool] = lambda _extension_id: False
         self._lock = RLock()
         self._actions = asyncio.Lock()
@@ -124,7 +128,7 @@ class ExtensionManager:
         self.has_catalog = catalog_path.is_file()
         if not self.has_catalog:
             return
-        self._add_catalog(self._source_root, preinstalled=True)
+        self._add_catalog(self._source_root, preinstalled=True, index_path=self._base_index)
         for root in bundled_extension_paths(self._source_root):
             self._add_catalog(root, preinstalled=False)
         if self._sources_path.is_file():
@@ -215,15 +219,23 @@ class ExtensionManager:
         if state_readable:
             self._save_records()
 
-    def _add_catalog(self, root: Path, *, preinstalled: bool, replace_existing: bool = False, restoring: bool = False) -> tuple[str, ...]:
+    def _add_catalog(self, root: Path, *, preinstalled: bool, replace_existing: bool = False, restoring: bool = False,
+                     index_path: Path | None = None) -> tuple[str, ...]:
         root = root.resolve()
-        index_path = root / 'config/service-index.json'
-        catalog = msgspec.json.decode((root / 'config/extensions.json').read_bytes(), type=ExtensionCatalog)
+        index_path = index_path or root / 'config/service-index.json'
+        catalog = msgspec.json.decode(index_path.with_name('extensions.json').read_bytes(), type=ExtensionCatalog)
         index = (read_service_index(index_path) if index_path.is_file() else
                  ServiceIndex(schemaVersion='f8serviceIndex/1', services=(), modelRoot='${F8_MODEL_ROOT}'))
         services = {item.serviceClass: item for item in index.services}
         owners = self._validate_catalog(catalog, services, root=root)
         descriptor_path = root / 'config/artifact.json'
+        source_path = index_path.with_name('extension-sources.json')
+        development_sources = (msgspec.json.decode(source_path.read_bytes(), type=dict[str, str])
+                               if preinstalled and source_path.is_file() else {})
+        if development_sources and descriptor_path.is_file():
+            raise ValueError('Published artifacts cannot declare development source checkouts')
+        if set(development_sources) - {manifest.extension_id for manifest in catalog.extensions}:
+            raise ValueError('Development sources must belong to declared extensions')
         if descriptor_path.is_file():
             descriptor = msgspec.json.decode(descriptor_path.read_bytes(), type=PublishedArtifact)
             if descriptor.kind != 'extension' or len(catalog.extensions) != 1:
@@ -240,7 +252,7 @@ class ExtensionManager:
             raise ValueError('Published extension catalog must not be empty')
         if not preinstalled and len(catalog.extensions) != 1:
             raise ValueError('An extension package must own exactly one extension')
-        runtime_catalog = read_runtime_catalog(root)
+        runtime_catalog = read_runtime_catalog(root, catalog_path=index_path.with_name('runtime-environments.json'))
         if not preinstalled and runtime_catalog.runtimes:
             manifest = catalog.extensions[0]
             if (manifest.runtime.kind != 'pixi'
@@ -283,7 +295,6 @@ class ExtensionManager:
         environments = self.environments if root == self._source_root else EnvironmentManager(
             self._data_dir, root, official=self.environments.official,
         )
-        payload = ExtensionPayload(root=root, index_path=index_path, index=index, environments=environments)
         # Keep old runtime sources: other installed extensions may still bind to
         # their immutable environment IDs, and replay reconstructs those bindings.
         for identifier in replaced:
@@ -296,8 +307,15 @@ class ExtensionManager:
             self._details.pop(identifier, None)
         for manifest in catalog.extensions:
             self._manifests[manifest.extension_id] = manifest
-            self._payloads[manifest.extension_id] = payload
-            self.runtime_registry.add_source(environments, manifest, official=preinstalled)
+            reference = development_sources.get(manifest.extension_id)
+            owner = environments
+            if reference is not None:
+                source = ServicePaths.for_index(root / 'config/service-index.json').package_path(reference, relative_to=root)
+                if not source.is_dir() or source == root:
+                    raise ValueError(f'Invalid development checkout for {manifest.extension_id}')
+                owner = EnvironmentManager(self._data_dir, source, official=self.environments)
+            self._payloads[manifest.extension_id] = ExtensionPayload(root, index_path, index, owner)
+            self.runtime_registry.add_source(owner, manifest, official=preinstalled and reference is None)
         self._services.update(services)
         self._owners.update(owners)
         if preinstalled:
@@ -377,7 +395,7 @@ class ExtensionManager:
                     if describe.service.serviceClass != service_class:
                         raise InvalidRequestError(f'Service description class mismatch: {service_class}')
                 services.append(ExtensionServiceDetail(service_class=service_class, describe=describe))
-            paths = ServicePaths.for_index(payload.index_path)
+            paths = index_paths(payload.index_path, payload.index)
             skills = tuple(ExtensionSkillDetail(
                 skill_id=skill.skill_id,
                 content=paths.package_path(skill.path, relative_to=payload.root).read_text(encoding='utf-8'),
@@ -389,7 +407,8 @@ class ExtensionManager:
         if any(tool.platforms and sys.platform not in tool.platforms for tool in manifest.tools):
             return False
         if manifest.tools and manifest.runtime.kind == 'native':
-            paths = ServicePaths.for_index(self._payloads[manifest.extension_id].index_path)
+            payload = self._payloads[manifest.extension_id]
+            paths = index_paths(payload.index_path, payload.index)
             if any(not paths.package_path(tool.command, relative_to=paths.package_path(tool.workdir, relative_to=paths.package_root)).is_file() for tool in manifest.tools):
                 return False
         return all(sys.platform in self._services[name].manifests or 'any' in self._services[name].manifests
@@ -411,7 +430,7 @@ class ExtensionManager:
         if self.status(extension_id).state != 'installed':
             raise InvalidRequestError('Extension must be installed and enabled')
         payload = self._payloads[extension_id]
-        return ServicePaths.for_index(payload.index_path).package_path(reference, relative_to=payload.root)
+        return index_paths(payload.index_path, payload.index).package_path(reference, relative_to=payload.root)
 
     def tool_launcher(self, extension_id: str, tool_id: str) -> tuple[ExtensionTool, list[str], Path, dict[str, str]]:
         if self.status(extension_id).state != 'installed':
@@ -421,7 +440,7 @@ class ExtensionManager:
         if tool is None:
             raise NotFoundError(f'Unknown extension tool: {extension_id}/{tool_id}')
         payload = self._payloads[extension_id]
-        paths = ServicePaths.for_index(payload.index_path)
+        paths = index_paths(payload.index_path, payload.index)
         cwd = paths.package_path(tool.workdir, relative_to=payload.root)
         args = [str(paths.resolve(arg, relative_to=cwd)) if '${' in arg else arg for arg in tool.args]
         if manifest.runtime.kind == 'native':
@@ -915,7 +934,7 @@ class ExtensionManager:
 
     def _copy_model_metadata(self, manifest: ExtensionManifest) -> None:
         for directory in manifest.model_directories:
-            source = self._payloads[manifest.extension_id].root / 'resources' / 'models' / directory
+            source = self._payloads[manifest.extension_id].index_path.parent.parent / 'resources' / 'models' / directory
             destination = self._model_root() / directory
             destination.mkdir(parents=True, exist_ok=True)
             for metadata in sorted(source.glob('*.yaml')):

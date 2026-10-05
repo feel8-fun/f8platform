@@ -28,7 +28,8 @@ class SharedRuntimeTarget:
 
 class EnvironmentManager:
     def __init__(self, data_dir: Path, source_root: Path, *, official: EnvironmentManager | None = None,
-                 dependency_root: Path | None = None, development_root: Path | None = None) -> None:
+                 dependency_root: Path | None = None, development_root: Path | None = None,
+                 runtime_catalog_path: Path | None = None) -> None:
         storage_file = data_dir / 'runtime-storage.json'
         storage = msgspec.json.decode(storage_file.read_bytes(), type=dict[str, str]) if storage_file.is_file() else {}
         configured_root = os.environ.get('F8_RUNTIME_STORAGE_ROOT')
@@ -45,11 +46,11 @@ class EnvironmentManager:
         self._workspace_environments: dict[str, str] = {}
         self.official = official if official is not None else self
         self.shared_targets: dict[str, SharedRuntimeTarget] = {}
-        self.runtime_releases = {item.runtime_id: item for item in read_runtime_catalog(source_root).runtimes}
+        self.runtime_releases = {item.runtime_id: item for item in read_runtime_catalog(source_root, catalog_path=runtime_catalog_path).runtimes}
         self._runtime_managers = {
             name: EnvironmentManager(data_dir, root, official=self, dependency_root=source_root,
                                      development_root=source_root if development == name else None)
-            for name, (root, development) in read_runtime_sources(source_root).items()
+            for name, (root, development) in read_runtime_sources(source_root, catalog_path=runtime_catalog_path).items()
         }
 
     @property
