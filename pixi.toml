@@ -16,3 +16,15 @@ serve = "python -m f8platform serve"
 
 [environments]
 platform-runtime = []
+platform-desktop = ["desktop"]
+
+[feature.desktop.pypi-dependencies]
+pystray = ">=0.19.5,<0.20"
+pillow = ">=11,<13"
+
+[feature.desktop.target.linux-64.dependencies]
+pygobject = ">=3.50,<4"
+gtk3 = ">=3.24,<4"
+
+[feature.desktop.tasks]
+tray = "python -m f8platform serve --tray"

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import ExitStack, contextmanager
+from collections.abc import Generator
 from dataclasses import dataclass
 import logging
 import os
@@ -44,7 +46,7 @@ from .errors import ConflictError, InvalidRequestError, NotFoundError
 from .extension_models import (
     ExtensionDetail, ExtensionServiceDetail, ExtensionSkillDetail,
     EnvironmentStatus, ExtensionCatalog, ExtensionImportRequest, ExtensionInstallPlan, ExtensionManifest,
-    ExtensionRecord, ExtensionStatus, PresetEnvironmentStatus, RuntimeStorageStatus,
+    ExtensionRecord, ExtensionStatus, RuntimeStorageStatus,
 )
 from .extension_operation import ExtensionInstallCancelled, InstallOperation
 from f8pysdk.release_spec import BundledExtensionCatalog, PublishedArtifact
@@ -61,6 +63,8 @@ class ExtensionPayload:
     index_path: Path
     index: ServiceIndex
     environments: EnvironmentManager
+    source_checkout: bool
+    release_sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -116,9 +120,6 @@ class ExtensionManager:
         self._source_digests: list[str] = []
         self._payloads: dict[str, ExtensionPayload] = {}
         self._records: dict[str, ExtensionRecord] = {}
-        self._bindings_path = self._root / 'runtime-bindings.json'
-        self._bindings = (msgspec.json.decode(self._bindings_path.read_bytes(), type=dict[str, str])
-                          if self._bindings_path.is_file() else {})
         self.runtime_registry = RuntimeRegistry(data_dir, self.environments)
         self._manifests: dict[str, ExtensionManifest] = {}
         self._services: dict[str, IndexedService] = {}
@@ -130,7 +131,7 @@ class ExtensionManager:
             return
         self._add_catalog(self._source_root, preinstalled=True, index_path=self._base_index)
         for root in bundled_extension_paths(self._source_root):
-            self._add_catalog(root, preinstalled=False)
+            self._add_catalog(root, preinstalled=False, release_sha256=root.name)
         if self._sources_path.is_file():
             try:
                 self._source_digests = msgspec.json.decode(self._sources_path.read_bytes(), type=list[str])
@@ -142,15 +143,11 @@ class ExtensionManager:
                     continue
                 snapshot = self._snapshot_sources()
                 try:
-                    self._add_catalog(self._root / 'payloads' / digest, preinstalled=False, replace_existing=True, restoring=True)
+                    self._add_catalog(self._root / 'payloads' / digest, preinstalled=False, replace_existing=True, restoring=True,
+                                      release_sha256=digest)
                 except (OSError, ValueError, msgspec.DecodeError, ConflictError):
                     self._restore_sources(snapshot)
                     logger.exception('Cannot load imported extension source %s', digest)
-        migrated_bindings = {extension_id: self.runtime_registry.canonical_id(identifier)
-                             for extension_id, identifier in self._bindings.items()}
-        if migrated_bindings != self._bindings:
-            self._bindings = migrated_bindings
-            self._save_bindings()
         state_readable = True
         if self._state_path.is_file():
             try:
@@ -225,7 +222,7 @@ class ExtensionManager:
             self._save_records()
 
     def _add_catalog(self, root: Path, *, preinstalled: bool, replace_existing: bool = False, restoring: bool = False,
-                     index_path: Path | None = None) -> tuple[str, ...]:
+                     index_path: Path | None = None, release_sha256: str | None = None) -> tuple[str, ...]:
         root = root.resolve()
         index_path = index_path or root / 'config/service-index.json'
         catalog = msgspec.json.decode(index_path.with_name('extensions.json').read_bytes(), type=ExtensionCatalog)
@@ -319,7 +316,8 @@ class ExtensionManager:
                 if not source.is_dir() or source == root:
                     raise ValueError(f'Invalid development checkout for {manifest.extension_id}')
                 owner = EnvironmentManager(self._data_dir, source, official=self.environments)
-            self._payloads[manifest.extension_id] = ExtensionPayload(root, index_path, index, owner)
+            source_checkout = reference is not None or (preinstalled and not descriptor_path.is_file() and release_sha256 is None)
+            self._payloads[manifest.extension_id] = ExtensionPayload(root, index_path, index, owner, source_checkout, release_sha256)
             self.runtime_registry.add_source(owner, manifest, official=preinstalled and reference is None)
         self._services.update(services)
         self._owners.update(owners)
@@ -377,10 +375,10 @@ class ExtensionManager:
         manifest = self._manifests.get(extension_id)
         if manifest is None:
             raise NotFoundError(f'Unknown extension: {extension_id}')
-        binding = self._bindings.get(extension_id)
-        if binding is not None and manifest.runtime.kind == 'shared':
-            return copy_model(manifest, update={'runtime': copy_model(manifest.runtime, update={'environment': binding})})
         return manifest
+
+    def manifest(self, extension_id: str) -> ExtensionManifest:
+        return self._manifest(extension_id)
 
     def detail(self, extension_id: str) -> ExtensionDetail:
         """Read package metadata without activating or launching its capabilities."""
@@ -538,7 +536,10 @@ class ExtensionManager:
                 tool_ids=tuple(tool.tool_id for tool in manifest.tools),
                 skill_ids=tuple(skill.skill_id for skill in manifest.skills),
                 resource_ids=tuple(resource.resource_id for resource in manifest.resources),
-                runtime_environment=manifest.runtime.environment, runtime_selectable=manifest.runtime.kind == 'shared',
+                runtime_environment=manifest.runtime.environment,
+                source_checkout=self._payloads[extension_id].source_checkout,
+                source_path=str(self._payloads[extension_id].environments.source_root) if self._payloads[extension_id].source_checkout else None,
+                release_sha256=self._payloads[extension_id].release_sha256,
             )
 
     def install_plan(self, extension_id: str) -> ExtensionInstallPlan:
@@ -549,8 +550,6 @@ class ExtensionManager:
             self._entry(manifest, name)
         return self._payloads[extension_id].environments.plan(manifest)
 
-    def preset_environments(self) -> tuple[PresetEnvironmentStatus, ...]:
-        return self.environments.presets()
 
     def _entry(self, manifest: ExtensionManifest, service_class: str) -> F8ServiceEntry:
         payload = self._payloads[manifest.extension_id]
@@ -581,7 +580,6 @@ class ExtensionManager:
         with self._lock:
             sources = self.runtime_registry.source_snapshot()
             ids = list(sources)
-            ids.extend(revision.environment_id for revision in self.runtime_registry.revisions() if revision.environment_id not in ids)
             result: list[EnvironmentStatus] = []
             for identifier in ids:
                 status = self.runtime_registry.status(identifier)
@@ -591,13 +589,11 @@ class ExtensionManager:
                 for extension_id, original in self._manifests.items():
                     manifest = self._manifest(extension_id)
                     record = self._records.get(extension_id)
-                    selected = self._bindings.get(extension_id)
                     owns = (source is not None and original.runtime.kind not in {'native', 'shared'}
                             and source.target.manager is self._payloads[extension_id].environments.for_environment(original.runtime.environment or 'studio-runtime')
                             and source.target.environment == (original.runtime.environment or ('studio-runtime' if original.runtime.kind == 'bundled' else None)))
-                    shared = original.runtime.kind == 'shared' and (selected == identifier or (
-                        selected is None and (manifest.runtime.environment == identifier or (
-                            source is not None and source.source == 'official' and source.name == manifest.runtime.environment))))
+                    shared = original.runtime.kind == 'shared' and (manifest.runtime.environment == identifier or (
+                        source is not None and source.source == 'official' and source.name == manifest.runtime.environment))
                     if owns or shared:
                         users.append(extension_id)
                         if record is not None and record.installed and source is not None:
@@ -606,6 +602,7 @@ class ExtensionManager:
                     'extension_ids': tuple(sorted(users)),
                     'service_classes': tuple(name for extension_id in users for name in self._manifests[extension_id].service_classes),
                     'tool_ids': tuple(f'{extension_id}/{tool.tool_id}' for extension_id in users for tool in self._manifests[extension_id].tools),
+                    'can_remove': status.runtime_kind == 'pixi' and identifier not in self._referenced_environments(),
                     'state': 'changed' if changed and status.state not in {'preparing', 'failed'} else status.state,
                     'detail': 'Installed extension records refer to an earlier environment definition. Prepare this environment to verify and update them.'
                     if changed and status.state not in {'preparing', 'failed'} else status.detail,
@@ -632,11 +629,6 @@ class ExtensionManager:
                 return
             source = self.runtime_registry.source(identifier)
             canonical_id = self.runtime_registry.status(identifier).environment_id
-            if canonical_id != identifier:
-                for extension_id, selected in tuple(self._bindings.items()):
-                    if selected == identifier:
-                        self._bindings[extension_id] = canonical_id
-                self._save_bindings()
             for current in self.environment_statuses():
                 if current.environment_id != canonical_id:
                     continue
@@ -652,39 +644,7 @@ class ExtensionManager:
         self._environment_refresh_task.add_done_callback(self._report_task_failure)
         return status
 
-    def _save_bindings(self) -> None:
-        self._root.mkdir(parents=True, exist_ok=True)
-        temporary = self._bindings_path.with_suffix('.tmp')
-        temporary.write_bytes(msgspec.json.encode(self._bindings))
-        temporary.replace(self._bindings_path)
 
-    async def select_runtime(self, extension_id: str, environment_id: str | None) -> ExtensionStatus:
-        async with self._actions:
-            self._require_idle()
-            manifest = self._manifest(extension_id)
-            if manifest.runtime.kind != 'shared':
-                raise InvalidRequestError('Runtime selection requires a shared Python extension declaration')
-            record = self._records.get(extension_id)
-            if record is not None and record.installed:
-                raise ConflictError('Uninstall the extension before changing its runtime')
-            if environment_id is not None:
-                selected = next((item for item in self.environment_statuses() if item.environment_id == environment_id), None)
-                if selected is None:
-                    raise NotFoundError(f'Unknown environment: {environment_id}')
-                if selected.state != 'ready':
-                    raise InvalidRequestError('Prepare and verify the selected environment before assigning it to an extension')
-            self.runtime_registry.validate_compatibility(manifest, environment_id or self._manifests[extension_id].runtime.environment)
-            previous = dict(self._bindings)
-            if environment_id is None:
-                self._bindings.pop(extension_id, None)
-            else:
-                self._bindings[extension_id] = environment_id
-            try:
-                self._save_bindings()
-            except OSError:
-                self._bindings = previous
-                raise
-            return self.status(extension_id)
 
     def set_runtime_storage(self, path: str) -> RuntimeStorageStatus:
         self._require_idle()
@@ -692,9 +652,28 @@ class ExtensionManager:
 
     def remove_environment(self, identifier: str) -> None:
         self._require_idle()
-        referenced = set(self._bindings.values())
-        referenced.update(item.environment_id for item in self.environment_statuses() if item.extension_ids)
-        self.runtime_registry.remove(identifier, referenced)
+        self.runtime_registry.remove(identifier, self._referenced_environments())
+
+    @contextmanager
+    def runtime_maintenance(self) -> Generator[None]:
+        with ExitStack() as scope:
+            with self._lock:
+                self._require_idle()
+                scope.enter_context(self.runtime_registry.maintenance())
+            yield
+
+    def referenced_environment_ids(self) -> set[str]:
+        with self._lock:
+            return self._referenced_environments()
+
+    @property
+    def runtime_busy(self) -> bool:
+        return self._operation is not None or self.runtime_registry.busy or (
+            self._environment_refresh_task is not None and not self._environment_refresh_task.done())
+
+    def clean_unused_environments(self, referenced: set[str]) -> None:
+        with self.runtime_maintenance():
+            self.runtime_registry.clean_unused_environments(referenced | self._referenced_environments())
 
     def _require_idle(self) -> None:
         if self._environment_refresh_task is not None and not self._environment_refresh_task.done():
@@ -738,7 +717,7 @@ class ExtensionManager:
                     snapshot = self._snapshot_sources()
                     committed = False
                     try:
-                        added = self._add_catalog(payload, preinstalled=False, replace_existing=True)
+                        added = self._add_catalog(payload, preinstalled=False, replace_existing=True, release_sha256=request.sha256)
                         if all(snapshot.payloads.get(identifier) is self._payloads[identifier] for identifier in added):
                             committed = True
                             return self.statuses()
@@ -798,6 +777,22 @@ class ExtensionManager:
             with self._lock:
                 self._operation = None
 
+    async def wait_installation(self, extension_id: str) -> None:
+        task = self._task
+        if task is not None:
+            await task
+        status = self.status(extension_id)
+        if status.state not in {'installed', 'disabled'}:
+            raise RuntimeError(status.detail or f'Installation did not complete: {extension_id}')
+
+    async def wait_preparation(self, identifier: str) -> None:
+        task = self._environment_refresh_task
+        if task is not None:
+            await task
+        status = self.runtime_registry.status(identifier)
+        if status.state != 'ready' or status.detail == 'Preparation cancelled':
+            raise RuntimeError(status.detail or f'Environment preparation did not complete: {identifier}')
+
     @staticmethod
     def _report_task_failure(task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -824,6 +819,10 @@ class ExtensionManager:
             await asyncio.to_thread(operation.cancel, force=True)
             await asyncio.shield(task)
         return self.status(extension_id)
+
+    def installation_running(self, extension_id: str) -> bool:
+        with self._lock:
+            return self._operation is not None and self._operation.extension_id == extension_id
 
     async def close(self) -> None:
         await self.runtime_registry.close()
@@ -869,9 +868,6 @@ class ExtensionManager:
                                        refresh)
             with self._lock:
                 referenced = self._referenced_environments()
-            referenced.update(source.target.plan.environment_id for key, source in self.runtime_registry.sources.items()
-                              if any(revision.request.base_environment_id == key for revision in self.runtime_registry.revisions())
-                              and source.target.plan.environment_id is not None)
             await asyncio.to_thread(self._payloads[extension_id].environments.remove_unused,
                                     previous.environment_id, referenced)
             await asyncio.to_thread(shutil.rmtree, self._registration(extension_id).parent)

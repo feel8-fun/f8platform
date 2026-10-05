@@ -726,6 +726,7 @@ packages:
   - pyyaml>=6.0.3,<7
   - httpx>=0.28,<1 ; extra == 'media'
   - pydantic>=2.11,<3 ; extra == 'platform-api'
+  - httpx>=0.28,<1 ; extra == 'platform-client'
   requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/13/bc/8c13eb66537dce1d2bd3a57132902f38d0e7f5bb46fa9f4daed9fe9d76ee/tomlkit-0.15.1-py3-none-any.whl
   name: tomlkit

@@ -17,12 +17,16 @@ MAX_ARCHIVE_BYTES = 2 * 1024**3
 MAX_EXTRACTED_BYTES = 8 * 1024**3
 
 
-def prepare_artifact(request: ExtensionImportRequest, root: Path) -> Path:
+def validate_import_request(request: ExtensionImportRequest) -> None:
     if not re.fullmatch(r'[0-9a-f]{64}', request.sha256):
         raise InvalidRequestError('Extension SHA-256 must contain 64 lowercase hexadecimal characters')
     parsed = urllib.parse.urlsplit(request.url)
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
         raise InvalidRequestError('Extension package URL must use HTTPS without embedded credentials')
+
+
+def prepare_artifact(request: ExtensionImportRequest, root: Path) -> Path:
+    validate_import_request(request)
     payload = root / 'payloads' / request.sha256
     if (payload / 'config/extensions.json').is_file():
         return payload

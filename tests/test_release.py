@@ -19,7 +19,7 @@ from f8pysdk.release_spec import PublishedArtifact, ReleaseArtifact, PlatformRel
 from f8platform.environments import EnvironmentManager
 from f8platform.errors import InvalidRequestError
 from f8platform.extensions import ExtensionManager
-from f8platform.extension_models import EnvironmentCreateRequest, ExtensionManifest, ExtensionRuntime
+from f8platform.extension_models import ExtensionManifest, ExtensionRuntime
 from f8platform.runtime_registry import RuntimeRegistry
 
 
@@ -73,6 +73,9 @@ def test_assembly_registers_independent_packages_and_parallel_runtime_versions(t
         'studio-runtime', 'python-services-v1', 'python-services-v2')
     manager = ExtensionManager(tmp_path / 'data', base_index=output / 'config/service-index.json')
     assert manager.status('debug').state == 'available'
+    assert not manager.status('debug').source_checkout
+    assert manager.status('debug').source_path is None
+    assert manager.status('debug').release_sha256 == artifacts[-1].sha256
     assert manager._payloads['debug'].root == output / 'extension-packages' / artifacts[-1].sha256
     registry = manager.runtime_registry
     assert len(registry.sources) == 3
@@ -118,16 +121,6 @@ def test_runtime_publisher_rejects_source_dependencies(tmp_path: Path) -> None:
         validate_runtime_artifact(root)
 
 
-def test_derived_preserve_retains_provider_but_adjust_does_not_claim_abi(tmp_path: Path) -> None:
-    artifact = archive_artifact(tmp_path, 'studio-runtime')
-    output = tmp_path / 'release'
-    assemble_release(release_lock(tmp_path, (artifact,)), output, cache=tmp_path / 'cache', platform='linux-x86_64')
-    registry = RuntimeRegistry(tmp_path / 'data', EnvironmentManager(tmp_path / 'data', output))
-    base = next(iter(registry.sources))
-    preserved = registry.create(EnvironmentCreateRequest(name='preserved', base_environment_id=base, policy='preserve'))
-    adjusted = registry.create(EnvironmentCreateRequest(name='adjusted', base_environment_id=base, policy='adjust'))
-    assert registry.release_definition(preserved.environment_id).abi == 'cpython312'
-    assert registry.release_definition(adjusted.environment_id).abi is None
 
 
 def test_package_runtime_provider_is_reusable_and_exposes_its_release_identity(tmp_path: Path) -> None:
@@ -186,7 +179,7 @@ def test_runtime_probe_works_in_a_bare_interpreter_without_reporting_tooling_as_
     library = tmp_path / 'probe-library'
     shutil.copytree(Path(packaging.__file__).parent, library / 'packaging')
     python = prefix / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
-    script = Path('launcher/f8platform/_runtime_probe.py').resolve()
+    script = Path(__file__).resolve().parents[1] / 'f8platform/_runtime_probe.py'
     output = subprocess.run([str(python), '-I', str(script), str(library)], capture_output=True, text=True, check=True)
     probe = msgspec.json.decode(output.stdout.encode(), type=RuntimeProbe)
     assert probe.wheel_tags

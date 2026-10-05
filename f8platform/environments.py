@@ -11,7 +11,7 @@ import msgspec
 from typing import Literal
 import urllib.request
 
-from .extension_models import ExtensionInstallPlan, ExtensionManifest, PresetEnvironmentStatus
+from .extension_models import ExtensionInstallPlan, ExtensionManifest
 from .extension_operation import InstallOperation
 from .errors import InvalidRequestError
 from .environment_definitions import environment_identity, local_wheels, materialize_locked_environment
@@ -189,11 +189,6 @@ class EnvironmentManager:
         return ExtensionInstallPlan(extension_id=extension_id,
                                     environment_id=f'bundled-base-{self._identity("studio-runtime")}',
                                     runtime_kind='bundled', action='bundled', requires_network=False)
-
-    def presets(self) -> tuple[PresetEnvironmentStatus, ...]:
-        return tuple(PresetEnvironmentStatus(environment=name,
-                                              ready=self.ready(self._preset_plan('', name).environment_id))
-                     for name in self._environments())
 
     def plan(self, manifest: ExtensionManifest) -> ExtensionInstallPlan:
         runtime = manifest.runtime

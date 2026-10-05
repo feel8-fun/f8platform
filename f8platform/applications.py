@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import hashlib
 import logging
@@ -31,6 +34,7 @@ from .environments import EnvironmentManager
 from .errors import ConflictError, InvalidRequestError, NotFoundError, ServiceUnavailableError
 from .extension_artifacts import MAX_ARCHIVE_BYTES, extract_archive
 from .extension_operation import InstallOperation
+from f8pysdk.extension_status import ExtensionInstallPlan
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +52,15 @@ class RunningApplication:
 
 
 class ApplicationManager:
+    @property
+    def runtime_busy(self) -> bool:
+        return self._actions.locked()
+
+    @asynccontextmanager
+    async def runtime_maintenance(self) -> AsyncGenerator[None]:
+        async with self._actions:
+            yield
+
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir.resolve()
         self.root = self.data_dir / 'applications'
@@ -70,6 +83,8 @@ class ApplicationManager:
         self.state = (msgspec.json.decode(self.state_path.read_bytes(), type=ApplicationState)
                       if self.state_path.is_file() else ApplicationState())
         self.running: dict[str, RunningApplication] = {}
+        self.require_external_dependents_stopped: Callable[[str], None] | None = None
+        self.require_source_stopped: Callable[[str], None] | None = None
         self._actions = asyncio.Lock()
         settings = self.root / 'configuration.json'
         self.configuration = (msgspec.json.decode(settings.read_bytes(), type=dict[str, dict[str, str]])
@@ -101,6 +116,14 @@ class ApplicationManager:
                                     version=manifest.version, description='Platform application runtime',
                                     runtime=ExtensionRuntime(kind='pixi', environment=manifest.launch.environment))
         return manifest, manager, request
+
+    def environment_sources(self) -> tuple[tuple[EnvironmentManager, ExtensionManifest], ...]:
+        return tuple((manager, request) for record in self.state.records
+                     for _manifest, manager, request in (self._runtime(record),))
+
+    def environment_plan(self, extension_id: str, sha256: str) -> ExtensionInstallPlan:
+        _manifest, manager, request = self._runtime(self._record(extension_id, sha256))
+        return manager.plan(request)
 
     def list(self) -> tuple[ApplicationStatus, ...]:
         statuses: list[ApplicationStatus] = []
@@ -224,6 +247,14 @@ class ApplicationManager:
             self.validate_selection(selected)
             self._save(ApplicationState(records=self.state.records, selected=dict(selected)))
 
+    async def deselect(self, extension_id: str) -> None:
+        async with self._actions:
+            self._require_stopped(extension_id)
+            selected = dict(self.state.selected)
+            selected.pop(extension_id, None)
+            self.validate_selection(selected)
+            self._save(ApplicationState(records=self.state.records, selected=selected))
+
     async def update(self, extension_id: str, sha256: str) -> None:
         async with self._actions:
             record = self._record(extension_id, sha256)
@@ -252,6 +283,8 @@ class ApplicationManager:
                 raise
 
     def _require_stopped(self, extension_id: str, *, allow_self: bool = False) -> None:
+        if self.require_external_dependents_stopped is not None:
+            self.require_external_dependents_stopped(extension_id)
         affected = {extension_id}
         manifests = self._manifests(self.state.selected)
         changed = True
@@ -321,6 +354,8 @@ class ApplicationManager:
                 raise
 
     async def _start(self, extension_id: str, started: list[str]) -> None:
+        if self.require_source_stopped is not None:
+            self.require_source_stopped(extension_id)
         record = self._record(extension_id)
         manifest, manager, request = self._runtime(record)
         active = self.running.get(extension_id)
@@ -350,7 +385,8 @@ class ApplicationManager:
                      'F8_RUNTIME_STORAGE_ROOT': str(self.data_dir),
                      'F8_SERVICE_INDEX': str(self.data_dir / 'distribution/config/service-index.json'),
                      **dict(zip(manifest.launch.env, self._expand(manifest, self._payload(record.sha256),
-                                                                 tuple(manifest.launch.env.values())), strict=True))},
+                                                                 tuple(manifest.launch.env.values())), strict=True)),
+                     'F8_PLATFORM_CONNECTION_FILE': str(self.data_dir / 'platform.json')},
                 start_new_session=os.name != 'nt',
             )
         except OSError:
@@ -360,9 +396,19 @@ class ApplicationManager:
         started.append(extension_id)
         await self._health(manifest, process, instance)
 
-    async def _health(self, manifest: ApplicationManifest, process: asyncio.subprocess.Process, instance: str) -> None:
+    async def check_health(self, manifest: ApplicationManifest, process: asyncio.subprocess.Process, instance: str,
+                           *, source_log: Path | None = None) -> None:
+        await self._health(manifest, process, instance, source_log=source_log)
+
+    async def stop_owned_process(self, active: RunningApplication) -> None:
+        await stop_owned_process(active)
+
+    async def _health(self, manifest: ApplicationManifest, process: asyncio.subprocess.Process, instance: str,
+                      *, source_log: Path | None = None) -> None:
         probe = manifest.health
-        endpoint = next(item.url for item in self.endpoints(manifest) if item.name == probe.endpoint)
+        endpoints = manifest.endpoints if source_log is not None else self.endpoints(manifest)
+        endpoint = next(item.url for item in endpoints if item.name == probe.endpoint)
+        log = source_log or self._log(manifest.extension_id)
         deadline = asyncio.get_running_loop().time() + probe.timeout_seconds
         last_error = 'No health response'
         bootstrapped = probe.bootstrap_path is None
@@ -370,7 +416,7 @@ class ApplicationManager:
             while asyncio.get_running_loop().time() < deadline:
                 if process.returncode is not None:
                     raise ServiceUnavailableError(f'{manifest.extension_id} exited ({process.returncode}); '
-                                                  f'log: {self._log(manifest.extension_id)}')
+                                                  f'log: {log}')
                 try:
                     if not bootstrapped:
                         bootstrap = await client.get(endpoint.rstrip('/') + (probe.bootstrap_path or '/'))
@@ -392,10 +438,12 @@ class ApplicationManager:
                     last_error = f'Unexpected health status: {data.get("status")}'
                 await asyncio.sleep(0.1)
         raise ServiceUnavailableError(f'{manifest.extension_id} startup timed out: {last_error}; '
-                                      f'log: {self._log(manifest.extension_id)}')
+                                      f'log: {log}')
 
     async def stop(self, extension_id: str) -> None:
         async with self._actions:
+            if self.require_external_dependents_stopped is not None:
+                self.require_external_dependents_stopped(extension_id)
             dependents = [name for name, manifest in self._manifests(self.state.selected).items()
                           if name != extension_id and any(item.extension_id == extension_id for item in manifest.requires)
                           and name in self.running and self.running[name].process.returncode is None]
@@ -407,28 +455,7 @@ class ApplicationManager:
         active = self.running.pop(extension_id, None)
         if active is None:
             return
-        process = active.process
-        try:
-            if process.returncode is None:
-                if process.stdin is not None:
-                    process.stdin.close()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=10)
-                except asyncio.TimeoutError:
-                    if os.name != 'nt':
-                        os.killpg(process.pid, signal.SIGTERM)
-                    else:
-                        process.terminate()
-                    try:
-                        await asyncio.wait_for(process.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        if os.name != 'nt':
-                            os.killpg(process.pid, signal.SIGKILL)
-                        else:
-                            process.kill()
-                        await process.wait()
-        finally:
-            active.log.close()
+        await stop_owned_process(active)
 
     async def uninstall(self, extension_id: str, sha256: str) -> None:
         async with self._actions:
@@ -446,3 +473,28 @@ class ApplicationManager:
         async with self._actions:
             for name in reversed(tuple(self.running)):
                 await self._stop(name)
+
+
+async def stop_owned_process(active: RunningApplication) -> None:
+    process = active.process
+    try:
+        if process.returncode is None:
+            if process.stdin is not None:
+                process.stdin.close()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                if os.name != 'nt':
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    if os.name != 'nt':
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                    await process.wait()
+    finally:
+        active.log.close()
