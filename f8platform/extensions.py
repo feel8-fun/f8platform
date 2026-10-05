@@ -208,6 +208,9 @@ class ExtensionManager:
                     if record.environment_id != plan.environment_id and self._registration(manifest.extension_id).is_file():
                         # Keep the verified existing registration until explicit
                         # preparation reconciles it with the new definition.
+                        # Its payload may have moved or been cleaned since the
+                        # last launch. Never expose an unreadable retained index.
+                        load_index_into_catalog(path=self._registration(manifest.extension_id), catalog=ServiceCatalog())
                         continue
                     self._copy_model_metadata(manifest)
                     self._write_registration(manifest, record)
@@ -215,7 +218,9 @@ class ExtensionManager:
                 except (OSError, ValueError, msgspec.DecodeError) as exc:
                     logger.exception('Cannot restore extension %s', manifest.extension_id)
                     self._records[manifest.extension_id] = copy_model(record, update={'installed': False, 'enabled': False})
-                    self._failures[manifest.extension_id] = f'{type(exc).__name__}: {exc}'
+                    self._failures[manifest.extension_id] = (
+                        f'{type(exc).__name__}: {exc}; reinstall this extension to restore its registration'
+                    )
         if state_readable:
             self._save_records()
 
