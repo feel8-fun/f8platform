@@ -178,8 +178,21 @@ class ExtensionManager:
                                    manifest.extension_id, record.version, manifest.version)
                     self._records[manifest.extension_id] = copy_model(record, update={'installed': False, 'enabled': False})
                     continue
+                payload = self._payloads[manifest.extension_id]
+                if payload.root == self._source_root and not (payload.root / 'config/artifact.json').is_file():
+                    descriptions = (
+                        index_paths(payload.index_path, payload.index, self._services[name]).package_path(
+                            self._services[name].describe, relative_to=payload.index_path.parent,
+                        ) for name in manifest.service_classes
+                    )
+                    missing = tuple(str(path) for path in descriptions if not path.is_file())
+                    if missing:
+                        detail = 'Build or prepare this extension; missing descriptions: ' + ', '.join(missing)
+                        logger.info('Development extension %s is not ready: %s', manifest.extension_id, detail)
+                        self._records[manifest.extension_id] = copy_model(record, update={'installed': False, 'enabled': False})
+                        self._failures[manifest.extension_id] = detail
+                        continue
                 try:
-                    payload = self._payloads[manifest.extension_id]
                     if manifest.runtime.kind == 'shared' and self._registration(manifest.extension_id).is_file():
                         environment = manifest.runtime.environment
                         assert environment is not None
