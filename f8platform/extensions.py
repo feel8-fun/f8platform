@@ -260,7 +260,12 @@ class ExtensionManager:
             paths = index_paths(index_path, index, item)
             for relative in (*item.manifests.values(), item.describe):
                 path = paths.package_path(relative, relative_to=index_path.parent)
-                if not path.is_relative_to(root) or not path.is_file():
+                # Development catalogs can precede native builds. Keep their
+                # metadata available; registration checks readiness per extension.
+                missing_development_describe = (
+                    preinstalled and not descriptor_path.is_file() and relative == item.describe
+                )
+                if not path.is_relative_to(root) or (not path.is_file() and not missing_development_describe):
                     raise ValueError(f'Missing or unsafe payload path for {item.serviceClass}: {relative}')
         environments = self.environments if root == self._source_root else EnvironmentManager(
             self._data_dir, root, official=self.environments.official,
