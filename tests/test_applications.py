@@ -53,7 +53,7 @@ def artifact(root: Path, name: str, *, version: str = '1.0', protocol: str = '1.
     (payload / 'config/extensions.json').write_bytes(msgspec.json.encode(catalog))
     (payload / 'config/service-index.json').write_text('{"schemaVersion":"f8serviceIndex/1","services":[],"modelRoot":"${F8_MODEL_ROOT}"}')
     (payload / 'config/artifact.json').write_bytes(msgspec.json.encode(PublishedArtifact(schema_version='f8artifact/1', artifact_id=name,
-        version=version, kind='extension', platform='linux-x86_64')))
+        version=version, kind='extension', platform='windows-x86_64' if sys.platform == 'win32' else 'linux-x86_64')))
     if web:
         (payload / 'web').mkdir()
         (payload / 'web/index.html').write_text('frontend')

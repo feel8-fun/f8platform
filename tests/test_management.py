@@ -14,8 +14,9 @@ import pytest
 
 from f8platform.api import access_token, create_app
 from f8platform.environments import EnvironmentManager
+from f8platform.extensions import ExtensionManager
 from f8platform.extension_operation import InstallOperation
-from f8pysdk.extension_status import ExtensionManifest, ExtensionInstallPlan
+from f8pysdk.extension_status import ExtensionManifest, ExtensionInstallPlan, ExtensionTool
 from f8pysdk.platform_client import PlatformClient, PlatformConnection
 from f8pysdk.platform_spec import DevelopmentCatalog
 from f8pysdk.tool_spec import ToolRunRequest
@@ -194,7 +195,16 @@ def sdk_client(data: Path, portal: TestClient) -> PlatformClient:
 def test_headless_tool_outlives_clients_and_can_be_stopped(tmp_path: Path) -> None:
     data = tmp_path/'data'
     app = create_app(data,source_index=tool_workspace(tmp_path/'source'))
-    with TestClient(app) as http:
+    original_launcher = ExtensionManager.tool_launcher
+
+    def launch(manager: ExtensionManager, extension_id: str, tool_id: str) -> tuple[ExtensionTool, list[str], Path, dict[str, str]]:
+        plan, command, cwd, env = original_launcher(manager, extension_id, tool_id)
+        if sys.platform == 'win32':
+            # Windows does not execute the fixture's POSIX shebang.
+            command = [sys.executable, *command]
+        return plan, command, cwd, env
+
+    with TestClient(app) as http, patch.object(ExtensionManager, 'tool_launcher', new=launch):
         headers = {'Authorization': f'Bearer {access_token(data)}'}
         status = http.get('/api/extensions', headers=headers).json()[0]
         assert status['sourceCheckout'] and status['state'] == 'installed'

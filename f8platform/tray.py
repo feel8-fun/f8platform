@@ -142,7 +142,7 @@ def run_tray(*, arguments: list[str], url: str, data_dir: Path) -> None:
         previous_int = signal.getsignal(signal.SIGINT)
         previous_term = signal.signal(signal.SIGTERM, lambda signum, frame: icon.stop())
         if sys.platform.startswith('linux'):
-            from gi.repository import GLib  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]  # GI exposes native modules without stubs.
+            from gi.repository import GLib  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue, reportUnknownVariableType]  # Linux-only GI exposes native modules without stubs.
 
             def install_interrupt_handler() -> bool:
                 # GTK's pystray backend resets SIGINT during initialization.

@@ -23,8 +23,11 @@ from f8platform.extension_models import ExtensionManifest, ExtensionRuntime
 from f8platform.runtime_registry import RuntimeRegistry
 
 
+HOST_PLATFORM = 'windows-x86_64' if sys.platform == 'win32' else 'linux-x86_64'
+OTHER_PLATFORM = 'linux-x86_64' if sys.platform == 'win32' else 'windows-x86_64'
+
 def archive_artifact(root: Path, name: str, *, version: str = '1.0', runtime: bool = True,
-                     platform: str = 'linux-x86_64') -> ReleaseArtifact:
+                     platform: str = HOST_PLATFORM) -> ReleaseArtifact:
     payload = root / f'{name}-{version}'
     (payload / 'config').mkdir(parents=True)
     descriptor = PublishedArtifact(schema_version='f8artifact/1', artifact_id=name, version=version,
@@ -33,11 +36,11 @@ def archive_artifact(root: Path, name: str, *, version: str = '1.0', runtime: bo
     if runtime:
         workspace = payload / 'runtimes' / name
         workspace.mkdir(parents=True)
-        (workspace / 'pixi.toml').write_text('[workspace]\nname="test"\nchannels=["conda-forge"]\nplatforms=["linux-64"]\n'
+        (workspace / 'pixi.toml').write_text('[workspace]\nname="test"\nchannels=["conda-forge"]\nplatforms=["linux-64", "win-64"]\n'
             '[dependencies]\npython="3.12.*"\n[environments]\n' + name + '=[]\n')
         package = {'conda': 'https://example.invalid/python-3.12.9-build_0.conda', 'sha256': 'a' * 64}
         (workspace / 'pixi.lock').write_text(yaml.safe_dump({'version': 6, 'environments': {
-            name: {'packages': {'linux-64': [{'conda': package['conda']}]}}}, 'packages': [package]}))
+            name: {'packages': {subdir: [{'conda': package['conda']}] for subdir in ('linux-64', 'win-64')}}}, 'packages': [package]}))
         (payload / 'config/runtime-environments.json').write_text(json.dumps({'schemaVersion': 'f8runtimeCatalog/1', 'runtimes': [{
             'runtimeId': name, 'providerId': 'feel8.python', 'version': version, 'abi': 'cpython312',
             'manifest': '${F8_PACKAGE_ROOT}/runtimes/' + name + '/pixi.toml',
@@ -61,7 +64,7 @@ def archive_artifact(root: Path, name: str, *, version: str = '1.0', runtime: bo
 
 def release_lock(root: Path, artifacts: tuple[ReleaseArtifact, ...]) -> Path:
     path = root / 'release.json'
-    path.write_bytes(msgspec.json.encode(PlatformReleaseLock(schema_version='f8platformRelease/1', platform='linux-x86_64', artifacts=artifacts, base_runtime='studio-runtime', startup=())))
+    path.write_bytes(msgspec.json.encode(PlatformReleaseLock(schema_version='f8platformRelease/1', platform=HOST_PLATFORM, artifacts=artifacts, base_runtime='studio-runtime', startup=())))
     return path
 
 
@@ -69,7 +72,7 @@ def test_assembly_registers_independent_packages_and_parallel_runtime_versions(t
     artifacts = (archive_artifact(tmp_path, 'studio-runtime'), archive_artifact(tmp_path, 'python-services-v1'),
                  archive_artifact(tmp_path, 'python-services-v2', version='2.0'), archive_artifact(tmp_path, 'debug', runtime=False))
     output = tmp_path / 'release'
-    assert assemble_release(release_lock(tmp_path, artifacts), output, cache=tmp_path / 'cache', platform='linux-x86_64') == (
+    assert assemble_release(release_lock(tmp_path, artifacts), output, cache=tmp_path / 'cache', platform=HOST_PLATFORM) == (
         'studio-runtime', 'python-services-v1', 'python-services-v2')
     manager = ExtensionManager(tmp_path / 'data', base_index=output / 'config/service-index.json')
     assert manager.status('debug').state == 'available'
@@ -94,7 +97,7 @@ def test_assembly_registers_independent_packages_and_parallel_runtime_versions(t
 
 @pytest.mark.parametrize('failure', ['checksum', 'platform', 'identity', 'traversal'])
 def test_assembly_failures_do_not_publish_partial_output(tmp_path: Path, failure: str) -> None:
-    artifact = archive_artifact(tmp_path, 'studio-runtime', platform='windows-x86_64' if failure == 'platform' else 'linux-x86_64')
+    artifact = archive_artifact(tmp_path, 'studio-runtime', platform=OTHER_PLATFORM if failure == 'platform' else HOST_PLATFORM)
     if failure == 'checksum':
         artifact = msgspec.structs.replace(artifact, sha256='b' * 64)
     elif failure == 'identity':
@@ -106,7 +109,7 @@ def test_assembly_failures_do_not_publish_partial_output(tmp_path: Path, failure
         artifact = msgspec.structs.replace(artifact, sha256=hashlib.sha256(archive.read_bytes()).hexdigest())
     output = tmp_path / 'release'
     with pytest.raises((ValueError, InvalidRequestError)):
-        assemble_release(release_lock(tmp_path, (artifact,)), output, cache=tmp_path / 'cache', platform='linux-x86_64')
+        assemble_release(release_lock(tmp_path, (artifact,)), output, cache=tmp_path / 'cache', platform=HOST_PLATFORM)
     assert not output.exists()
     assert not (tmp_path / 'escape.txt').exists()
 
@@ -143,7 +146,7 @@ def test_package_runtime_provider_is_reusable_and_exposes_its_release_identity(t
                 archive.write(item, item.relative_to(package).as_posix())
     extension = msgspec.structs.replace(extension, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
     output = tmp_path / 'release'
-    assemble_release(release_lock(tmp_path, (base, extension)), output, cache=tmp_path / 'cache', platform='linux-x86_64')
+    assemble_release(release_lock(tmp_path, (base, extension)), output, cache=tmp_path / 'cache', platform=HOST_PLATFORM)
     manager = ExtensionManager(tmp_path / 'data', base_index=output / 'config/service-index.json')
     identifier = next(key for key, source in manager.runtime_registry.sources.items() if source.name == 'private-v1')
     assert manager.runtime_registry.source(identifier).source == 'package'
@@ -201,7 +204,7 @@ def test_extension_version_switch_rollback_and_restart_do_not_require_studio_reb
     old = archive_artifact(tmp_path, 'debug', version='1.0', runtime=False)
     new = archive_artifact(tmp_path, 'debug', version='2.0', runtime=False)
     output = tmp_path / 'release'
-    assemble_release(release_lock(tmp_path, (base,)), output, cache=tmp_path / 'cache', platform='linux-x86_64')
+    assemble_release(release_lock(tmp_path, (base,)), output, cache=tmp_path / 'cache', platform=HOST_PLATFORM)
     manager = ExtensionManager(tmp_path / 'data', base_index=output / 'config/service-index.json')
 
     async def import_version(artifact: ReleaseArtifact) -> None:
@@ -253,7 +256,7 @@ def test_failed_version_selection_restores_catalog_and_runtime_sources(tmp_path:
     old = archive_artifact(tmp_path, 'debug', version='1.0', runtime=False)
     new = archive_artifact(tmp_path, 'debug', version='2.0', runtime=False)
     output = tmp_path / 'release'
-    assemble_release(release_lock(tmp_path, (base, old)), output, cache=tmp_path / 'cache', platform='linux-x86_64')
+    assemble_release(release_lock(tmp_path, (base, old)), output, cache=tmp_path / 'cache', platform=HOST_PLATFORM)
     manager = ExtensionManager(tmp_path / 'data', base_index=output / 'config/service-index.json')
     sources = dict(manager.runtime_registry.sources)
     original_replace = Path.replace
@@ -287,9 +290,9 @@ def test_platform_release_assembles_components_without_studio_base(tmp_path: Pat
         artifacts.append(ReleaseArtifact(artifact_id=name, version='1.0', kind='extension', location=str(path), sha256=digest))
     lock = tmp_path / 'platform-release.json'
     lock.write_bytes(msgspec.json.encode(PlatformReleaseLock(schema_version='f8platformRelease/1',
-        platform='linux-x86_64', artifacts=tuple(artifacts), startup=('studio',))))
+        platform=HOST_PLATFORM, artifacts=tuple(artifacts), startup=('studio',))))
     output = tmp_path / 'installed platform'
-    assert assemble_release(lock, output, cache=tmp_path / 'cache', platform='linux-x86_64') == ('platform-runtime',)
+    assert assemble_release(lock, output, cache=tmp_path / 'cache', platform=HOST_PLATFORM) == ('platform-runtime',)
     assert json.loads((output / 'config/bootstrap.json').read_text())['module'] == 'f8platform'
     catalog = json.loads((output / 'config/extension-packages.json').read_text())
     assert len(catalog['packages']) == 2
@@ -306,8 +309,8 @@ def test_platform_release_rejects_incompatible_components_before_publication(tmp
         artifacts.append(ReleaseArtifact(artifact_id=name, version='1.0', kind='extension', location=str(path), sha256=digest))
     lock = tmp_path / 'platform-release.json'
     lock.write_bytes(msgspec.json.encode(PlatformReleaseLock(schema_version='f8platformRelease/1',
-        platform='linux-x86_64', artifacts=tuple(artifacts), startup=('studio',))))
+        platform=HOST_PLATFORM, artifacts=tuple(artifacts), startup=('studio',))))
     output = tmp_path / 'installed'
     with pytest.raises(ConflictError, match='protocol'):
-        assemble_release(lock, output, cache=tmp_path / 'cache', platform='linux-x86_64')
+        assemble_release(lock, output, cache=tmp_path / 'cache', platform=HOST_PLATFORM)
     assert not output.exists()

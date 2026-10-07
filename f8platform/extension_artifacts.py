@@ -73,7 +73,7 @@ def extract_archive(archive: Path, payload: Path, *, required: tuple[str, ...]) 
             names: set[str] = set()
             for item in files:
                 relative = PurePosixPath(item.filename)
-                if (relative.is_absolute() or '..' in relative.parts or '\\' in item.filename
+                if (relative.is_absolute() or '..' in relative.parts or '\\' in item.orig_filename
                         or ':' in item.filename or not relative.parts or item.filename in names):
                     raise InvalidRequestError(f'Invalid extension archive path: {item.filename}')
                 names.add(item.filename)

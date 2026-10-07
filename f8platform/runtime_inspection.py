@@ -34,7 +34,11 @@ def file_stats(roots: Iterable[Path]) -> Iterator[tuple[Path, os.stat_result]]:
                             if entry.is_dir(follow_symlinks=False):
                                 pending.append(Path(entry.path))
                             else:
-                                yield directory, entry.stat(follow_symlinks=False)
+                                # Windows DirEntry.stat omits file identity and
+                                # link counts; os.stat supplies them for NTFS.
+                                result = (os.stat(entry.path, follow_symlinks=False) if os.name == 'nt'
+                                          else entry.stat(follow_symlinks=False))
+                                yield directory, result
                         except FileNotFoundError:
                             logging.getLogger(__name__).debug(
                                 'File disappeared during storage inspection: %s', entry.path, exc_info=True
