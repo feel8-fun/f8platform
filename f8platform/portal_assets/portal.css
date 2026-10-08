@@ -2,3 +2,5 @@
 
 .card code{overflow-wrap:anywhere;font-size:12px}.card details{margin:8px 0}.card summary{cursor:pointer;color:#a4b3cd}
 #tasks{margin-bottom:24px;padding:18px;border:1px solid #303c51;border-radius:10px;background:#171d29}.task-row>div:first-child{min-width:0;overflow-wrap:anywhere}.task-row .actions{flex-shrink:0;margin:0}#refresh-status{color:#a4b3cd;font-size:12px;margin-right:12px}.queued{background:#494124;color:#ecdc96}.failed{background:#492734;color:#ffd6dc}.succeeded{background:#204a3e;color:#9ae0bc}
+
+.history-toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px}.history-toolbar h2{margin-right:auto}#tasks{padding:10px 14px}#tasks:has(>button){border:0;background:none;padding:0}summary{cursor:pointer;color:#a4b3cd}.history-records{max-height:320px;overflow:auto;margin-top:8px}.task-row{padding:8px 0}.task-row time{margin-left:8px}.tool-history{margin-top:20px}#detail pre{max-height:400px;overflow:auto}.tool-history .row{flex-wrap:wrap;gap:8px}

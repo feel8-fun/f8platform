@@ -10,6 +10,19 @@ let pollingJob = false;
 let pollingTaskLog = false;
 let pollingTasks = false;
 let managementJobs = [];
+let taskPanelClosed = false;
+let taskPanelOpen = false;
+let toolHistoryClosed = false;
+let toolHistoryOpen = false;
+const dismissedTasks = new Set((localStorage.getItem('f8-maintenance-dismissed') || '').split('\n').filter(Boolean));
+const dismissedTools = new Set((localStorage.getItem('f8-tool-dismissed') || '').split('\n').filter(Boolean));
+const activeJob = state => ['queued','running'].includes(state);
+function dismissRecords(key, dismissed, ids) {
+  for(const id of ids) dismissed.add(id);
+  localStorage.setItem(key, [...dismissed].join('\n'));
+}
+function closeDetail() { detailRevision++;inspectedJob=null;inspectedResource=null;detail.hidden=true; }
+function detailCloseButton() { action(detail,'Close details',closeDetail); }
 let tasksSignature = '';
 let statesSignature = '[]';
 let toolStatesSignature = '[]';
@@ -34,7 +47,7 @@ async function api(path, method='GET', body, signal) {
 function action(parent, label, run) { const btn = node('button',label); btn.onclick = async () => { btn.disabled = true; error.hidden = true; const revision=navigationRevision; try { await run(); } catch(reason) { if(revision===navigationRevision) fail(reason); } finally { btn.disabled = false; } }; parent.append(btn); return btn; }
 function card(title, description) { const el = node('article',undefined,'card'); el.append(node('h2',title)); if(description) el.append(node('p',description,'meta')); return el; }
 function badge(parent,text) { parent.append(node('span',text,'badge '+text)); }
-function showDetail(title,value,jobId=null) { inspectedResource=null;inspectedJob=jobId;detailRevision++;detail.hidden=false; detail.replaceChildren(node('h2',title),node('pre',typeof value === 'string' ? value : JSON.stringify(value,null,2))); detail.scrollIntoView({behavior:'smooth',block:'nearest'}); }
+function showDetail(title,value,jobId=null) { inspectedResource=null;inspectedJob=jobId;detailRevision++;detail.hidden=false; detail.replaceChildren(node('h2',title),node('pre',typeof value === 'string' ? value : JSON.stringify(value,null,2))); detailCloseButton();detail.scrollIntoView({behavior:'smooth',block:'nearest'}); }
 async function inspect(title,path,jobId=null,format=value=>value) {
   const navigation=navigationRevision;
   const revision=++detailRevision;
@@ -50,22 +63,41 @@ function taskRows(parent,jobs) {
   for(const job of jobs) {
     const row=node('article',undefined,'row task-row');const summary=node('div');
     summary.append(node('strong',taskTitle(job)));badge(summary,job.state);
-    if(job.detail)summary.append(node('p',job.detail,'meta'));
+    summary.append(node('time',new Date(job.createdAt*1000).toLocaleString(),'meta'));
+    if(job.startedAt != null)summary.append(node('small',` · ${Math.max(0,(job.finishedAt ?? Date.now()/1000)-job.startedAt).toFixed(1)}s`,'meta'));
     row.append(summary);const buttons=node('div',undefined,'actions');row.append(buttons);
     action(buttons,'Task details / logs',()=>inspect(taskTitle(job),`management-jobs/${job.jobId}/logs`,null,logs=>logs.log || job.detail));
     if(['queued','running'].includes(job.state) && job.cancellable && !job.cancelRequested)
       action(buttons,'Cancel task',async()=>{await api(`management-jobs/${job.jobId}/cancel`,'POST');await pollTasks();});
+    if(!activeJob(job.state))action(buttons,'Dismiss',()=>{dismissRecords('f8-maintenance-dismissed',dismissedTasks,[job.jobId]);renderTaskPanel();if(view==='tasks')void load();});
     parent.append(row);
   }
 }
 function renderTaskPanel() {
+  const visible=managementJobs.filter(job=>activeJob(job.state) || !dismissedTasks.has(job.jobId));
+  const active=visible.filter(job=>activeJob(job.state));
   taskPanel.hidden=!managementJobs.length || view==='tasks';
-  const active=managementJobs.filter(job=>['queued','running'].includes(job.state)).sort((a,b)=>a.createdAt-b.createdAt);
-  const recent=managementJobs.filter(job=>!['queued','running'].includes(job.state)).slice(0,3);
-  taskPanel.replaceChildren(node('h2',`Maintenance tasks · ${active.length} active`));
-  taskRows(taskPanel,[...active,...recent]);
+  taskPanel.replaceChildren();
+  if(taskPanelClosed) {action(taskPanel,`Show maintenance tasks · ${active.length} active`,()=>{taskPanelClosed=false;renderTaskPanel();});return;}
+  const heading=node('div',undefined,'history-toolbar');taskPanel.append(heading);
+  heading.append(node('h2',`Maintenance tasks · ${active.length} active`));
+  clearTasksButton(heading,visible);
+  action(heading,'Close tasks',()=>{taskPanelClosed=true;renderTaskPanel();});
+  const records=node('details');records.open=taskPanelOpen;records.ontoggle=()=>{taskPanelOpen=records.open;};
+  records.append(node('summary',`Task records · ${visible.length}`));
+  const rows=node('div',undefined,'history-records');taskRows(rows,visible);records.append(rows);taskPanel.append(records);
 }
-async function tasks(content) {content.append(node('h1','Tasks'),node('p','Installation and environment maintenance run one at a time. Other pages remain available.','meta'));taskRows(content,managementJobs);}
+function clearTasksButton(parent,jobs) {
+  const completed=jobs.filter(job=>!activeJob(job.state));
+  const button=action(parent,'Clear completed',()=>{dismissRecords('f8-maintenance-dismissed',dismissedTasks,completed.map(job=>job.jobId));closeDetail();renderTaskPanel();if(view==='tasks')void load();});
+  button.disabled=!completed.length;
+}
+async function tasks(content) {
+  content.append(node('h1','Tasks'));
+  const visible=managementJobs.filter(job=>activeJob(job.state) || !dismissedTasks.has(job.jobId));
+  clearTasksButton(content,visible);taskRows(content,visible);
+  if(!visible.length)content.append(node('p','No task records.','empty'));
+}
 async function extensions(content,signal) {
   const [items,sources,apps,startup] = await Promise.all([api('extensions','GET',undefined,signal),api('source-applications','GET',undefined,signal),api('applications','GET',undefined,signal),api('startup','GET',undefined,signal)]);
   updatingApplications=items.some(item=>item.applicationOperation?.state==='running');
@@ -173,12 +205,29 @@ async function tools(content,signal) {
       const el=card(tool.name,tool.description);grid.append(el);action(el,'Open tool',()=>toolForm(tool));
     }
   }
-  content.append(node('h2','Tool jobs'));
-  for(const job of jobs.slice(0,30)) {const row=node('div',undefined,'row');row.append(node('span',`${job.extensionId} / ${job.toolId} · ${job.status}`));action(row,'Result / logs',()=>inspect(job.toolId,`tool-jobs/${job.jobId}`,job.jobId));if(['queued','running'].includes(job.status))action(row,'Stop',async()=>{await api(`tool-jobs/${job.jobId}/cancel`,'POST');await load();});content.append(row);}
+  const visible=jobs.filter(job=>activeJob(job.status) || !dismissedTools.has(job.jobId));
+  const history=node('section',undefined,'tool-history');content.append(history);
+  if(toolHistoryClosed)action(history,'Show tool history',()=>{toolHistoryClosed=false;void load();});
+  else {
+    const heading=node('div',undefined,'history-toolbar');history.append(heading);heading.append(node('h2','Tool jobs'));
+    const completed=visible.filter(job=>!activeJob(job.status));
+    const clear=action(heading,'Clear completed',()=>{dismissRecords('f8-tool-dismissed',dismissedTools,completed.map(job=>job.jobId));closeDetail();void load();});clear.disabled=!completed.length;
+    action(heading,'Close history',()=>{toolHistoryClosed=true;void load();});
+    const records=node('details');records.open=toolHistoryOpen;records.ontoggle=()=>{toolHistoryOpen=records.open;};records.append(node('summary',`Task records · ${visible.length}`));history.append(records);
+    const rows=node('div',undefined,'history-records');records.append(rows);
+    for(const job of visible) {
+      const row=node('div',undefined,'row');row.append(node('strong',`${job.extensionId} / ${job.toolId}`));badge(row,job.status);
+      if(job.createdAt)row.append(node('time',new Date(job.createdAt).toLocaleString(),'meta'));
+      action(row,'Result / logs',()=>inspect(job.toolId,`tool-jobs/${job.jobId}`,job.jobId));
+      if(activeJob(job.status))action(row,'Stop',async()=>{await api(`tool-jobs/${job.jobId}/cancel`,'POST');await load();});
+      else action(row,'Dismiss',()=>{dismissRecords('f8-tool-dismissed',dismissedTools,[job.jobId]);void load();});
+      rows.append(row);
+    }
+  }
   if(!items.length)content.append(node('p','Install and enable an extension with tools to get started.','empty'));
 }
 function toolForm(tool) {
-  inspectedJob=null;inspectedResource=null;detailRevision++;detail.hidden=false;detail.replaceChildren(node('h2',tool.name));const form=node('form');detail.append(form);const controls=new Map();
+  inspectedJob=null;inspectedResource=null;detailRevision++;detail.hidden=false;detail.replaceChildren(node('h2',tool.name));detailCloseButton();const form=node('form');detail.append(form);const controls=new Map();
   for(const field of tool.fields) {
     const label=node('label',field.label || field.name);let input;
     if(field.choices?.length){input=node('select');for(const option of field.choices || []){const el=node('option',String(option));el.value=String(option);input.append(el);}}
@@ -188,7 +237,7 @@ function toolForm(tool) {
   }
   let confirm;if(tool.requiresConfirmation){const label=node('label','Confirm execution');confirm=node('input');confirm.type='checkbox';confirm.required=true;label.prepend(confirm);form.append(label);}
   const submit=node('button','Run');submit.type='submit';form.append(submit);
-  form.onsubmit=async event=>{event.preventDefault();submit.disabled=true;const revision=navigationRevision;try {const argumentsObject={};for(const [name,{field,input}]of controls){argumentsObject[name]=field.kind==='boolean' ? input.checked : ['number','integer'].includes(field.kind)?Number(input.value):input.value;}const job=await api(`extension-tools/${tool.extensionId}/${tool.toolId}/run`,'POST',{arguments:argumentsObject,confirm:Boolean(confirm?.checked)});if(revision!==navigationRevision)return;showDetail(tool.name,job,job.jobId);await load();}catch(reason){if(revision===navigationRevision)fail(reason);}finally{submit.disabled=false;}};
+  form.onsubmit=async event=>{event.preventDefault();submit.disabled=true;const revision=navigationRevision;try {const argumentsObject={};for(const [name,{field,input}]of controls){argumentsObject[name]=field.kind==='boolean' ? input.checked : ['number','integer'].includes(field.kind)?Number(input.value):input.value;}const job=await api(`extension-tools/${tool.extensionId}/${tool.toolId}/run`,'POST',{arguments:argumentsObject,confirm:Boolean(confirm?.checked)});if(revision!==navigationRevision)return;closeDetail();toolHistoryClosed=false;await load();}catch(reason){if(revision===navigationRevision)fail(reason);}finally{submit.disabled=false;}};
 }
 async function processes(content,signal) {
   content.append(node('h1','Service processes'));const items=await api('service-processes','GET',undefined,signal);
