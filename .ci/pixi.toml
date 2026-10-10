@@ -12,5 +12,12 @@ hatchling = ">=1.28,<2"
 pytest = ">=8.4,<9"
 f8pysdk = {path = "../.sdk/python", editable = true}
 
+f8platform = {path = "..", editable = true, extras = ["desktop"]}
+basedpyright = ">=1.31,<2"
+httpx = ">=0.28,<1"
+
 [tasks]
 publish = "python ../publish.py"
+
+test = {cmd = "python -m pytest tests -q", cwd = ".."}
+typecheck = {cmd = "basedpyright -p pyrightconfig.json", cwd = ".."}

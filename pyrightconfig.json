@@ -1,0 +1,18 @@
+{
+  "pythonVersion": "3.14",
+  "typeCheckingMode": "strict",
+  "include": [
+    "f8platform"
+  ],
+  "exclude": [
+    ".sdk",
+    ".ci/.pixi",
+    "build",
+    "dist",
+    "**/__pycache__"
+  ],
+  "extraPaths": [
+    ".sdk/python"
+  ],
+  "reportMissingTypeStubs": "none"
+}

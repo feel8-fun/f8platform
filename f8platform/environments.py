@@ -15,6 +15,7 @@ from .extension_models import ExtensionInstallPlan, ExtensionManifest
 from .extension_operation import InstallOperation
 from .errors import InvalidRequestError
 from .environment_definitions import environment_identity, local_wheels, materialize_locked_environment
+from .runtime_migrations import legacy_environment_id
 from .runtime_sources import read_runtime_catalog, equivalent_environment, read_runtime_sources
 
 
@@ -66,18 +67,8 @@ class EnvironmentManager:
         return self._runtime_managers.get(environment, self)
 
     def legacy_environment_id(self, environment: str) -> str | None:
-        bundled = environment == 'studio-runtime' and (self.official._source_root / 'env').is_dir()
-        root = self.official._source_root if bundled else self._development_root
-        if root is None or not (root / 'pixi.lock').is_file():
-            return None
-        definitions = tomllib.loads((root / 'pixi.toml').read_text(encoding='utf-8')).get('environments', {})
-        if environment not in definitions:
-            return None
-        identity = environment_identity(root, environment)
-        if bundled:
-            return f'bundled-base-{identity}'
-        location = hashlib.sha256(str(root).encode()).hexdigest()[:16]
-        return f'workspace-{location}-{environment}-{identity[:16]}'
+        return legacy_environment_id(environment, official_source_root=self.official._source_root,
+                                     development_root=self._development_root)
 
     def can_reuse_development_environment(self, environment: str) -> bool:
         if environment == 'studio-runtime' and (self.official._source_root / 'env').is_dir():

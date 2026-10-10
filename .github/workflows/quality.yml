@@ -1,0 +1,29 @@
+name: quality
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: feel8-fun/f8sdk
+          ref: a977f137b8280db8566bd52a62a1805092725fb9
+          path: .sdk
+      - uses: prefix-dev/setup-pixi@v0.9.3
+        with:
+          pixi-version: v0.81.0
+          manifest-path: .ci/pixi.toml
+          cache: true
+      - run: pixi run --locked --manifest-path .ci/pixi.toml typecheck
+      - run: pixi run --locked --manifest-path .ci/pixi.toml test
+      - run: pixi run --locked --manifest-path .ci/pixi.toml python -m pip wheel --no-deps --no-build-isolation -w build/wheels .
