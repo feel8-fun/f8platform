@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from f8platform.management_jobs import ManagementJobs
+from f8platform.errors import ConflictError, NotFoundError
 from f8pysdk.management_job import ManagementJobRequest
 
 
@@ -89,5 +90,84 @@ def test_restart_reports_interrupted_tasks_without_replaying_mutations(tmp_path:
         assert 'Platform stopped' in restored.get(job.job_id).detail
         await queue.close()
         await restored.close()
+
+    asyncio.run(run())
+
+
+def test_clearing_finished_history_survives_restart_and_preserves_the_active_queue(tmp_path: Path) -> None:
+    async def run() -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+        executed: list[str | None] = []
+
+        async def execute(request: ManagementJobRequest) -> None:
+            executed.append(request.extension_id)
+            if request.extension_id == 'failed':
+                raise ValueError('Fixture installation failed')
+            if request.extension_id == 'running':
+                entered.set()
+                await release.wait()
+
+        queue = ManagementJobs(tmp_path, execute, no_cancel, lambda _: '', lambda _: True)
+        succeeded = queue.submit(ManagementJobRequest(action='install-extension', extension_id='succeeded'))
+        failed = queue.submit(ManagementJobRequest(action='install-extension', extension_id='failed'))
+        running = queue.submit(ManagementJobRequest(action='install-extension', extension_id='running'))
+        cancelled = queue.submit(ManagementJobRequest(action='install-extension', extension_id='cancelled'))
+        queued = queue.submit(ManagementJobRequest(action='install-extension', extension_id='queued'))
+        try:
+            await entered.wait()
+            await queue.cancel(cancelled.job_id)
+            assert (tmp_path / f'{failed.job_id}.log').is_file()
+            cleared = (succeeded.job_id, failed.job_id, cancelled.job_id)
+            for active in (running, queued):
+                with pytest.raises(ConflictError, match='active management task'):
+                    queue.clear_completed((*cleared, active.job_id))
+                assert all((tmp_path / f'{identifier}.json').is_file() for identifier in cleared)
+            remaining = queue.clear_completed((*cleared, failed.job_id, 'already-removed'))
+            assert {job.job_id for job in remaining} == {running.job_id, queued.job_id}
+            assert not (tmp_path / f'{failed.job_id}.log').exists()
+            for identifier in cleared:
+                assert not (tmp_path / f'{identifier}.json').exists()
+                with pytest.raises(NotFoundError):
+                    queue.get(identifier)
+            assert queue.clear_completed(cleared) == remaining
+            release.set()
+            while queue.get(queued.job_id).state in {'queued', 'running'}:
+                await asyncio.sleep(0)
+        finally:
+            release.set()
+            await queue.close()
+        assert executed == ['succeeded', 'failed', 'running', 'queued']
+        restored = ManagementJobs(tmp_path, execute, no_cancel, lambda _: '', lambda _: True)
+        assert {job.job_id for job in restored.list()} == {running.job_id, queued.job_id}
+        assert all(job.state == 'succeeded' for job in restored.list())
+        await restored.close()
+
+    asyncio.run(run())
+
+
+def test_clearing_cancelled_job_does_not_break_pending_cancellation(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    async def run() -> None:
+        entered, release, cancelling = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def execute(_request: ManagementJobRequest) -> None:
+            entered.set()
+            await release.wait()
+
+        async def cancel(_request: ManagementJobRequest) -> bool:
+            cancelling.set()
+            return False
+
+        queue = ManagementJobs(tmp_path, execute, cancel, lambda _: '', lambda _: True)
+        job = queue.submit(ManagementJobRequest(action='install-extension', extension_id='extension'))
+        await entered.wait()
+        await queue.cancel(job.job_id)
+        await cancelling.wait()
+        release.set()
+        while queue.get(job.job_id).state == 'running':
+            await asyncio.sleep(0)
+        assert queue.get(job.job_id).state == 'cancelled'
+        assert queue.clear_completed((job.job_id,)) == ()
+        await queue.close()
+        assert not caplog.records
 
     asyncio.run(run())

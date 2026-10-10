@@ -14,7 +14,7 @@ from f8pysdk.extension_status import (
 )
 from f8pysdk.platform_spec import ServiceStartRequest
 from f8pysdk.tool_spec import ToolRunRequest
-from f8pysdk.management_job import ManagementJobRequest
+from f8pysdk.management_job import ManagementJobRequest, ManagementJobsClearRequest
 from .runtime import PlatformRuntime
 
 T = TypeVar('T')
@@ -39,6 +39,11 @@ def install_management_routes(app: FastAPI, get_runtime: Callable[[], PlatformRu
     @app.post('/api/management-jobs', status_code=202)
     async def submit_management_job(request: Request) -> F8JsonValue:
         return _json_value(get_runtime().submit_job(await decode_body(request, ManagementJobRequest)))
+
+    @app.post('/api/management-jobs/clear-completed')
+    async def clear_completed_management_jobs(request: Request) -> F8JsonValue:
+        payload = await decode_body(request, ManagementJobsClearRequest)
+        return _json_value(get_runtime().jobs.clear_completed(payload.job_ids))
 
     @app.get('/api/management-jobs/{job_id}')
     async def management_job(job_id: str) -> F8JsonValue:

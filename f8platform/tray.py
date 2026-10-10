@@ -9,7 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from urllib.parse import urlsplit
 import webbrowser
 
@@ -73,12 +73,24 @@ def run_tray(*, arguments: list[str], url: str, data_dir: Path) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     log_path = data_dir / 'platform-console.log'
     with log_path.open('ab', buffering=0) as output:
-        process = subprocess.Popen(
-            [sys.executable, '-u', '-m', 'f8platform', *arguments, '--exit-on-stdin-close'],
-            stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT,
-            start_new_session=os.name != 'nt',
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-        )
+        def launch_process() -> subprocess.Popen[bytes]:
+            return subprocess.Popen(
+                [sys.executable, '-u', '-m', 'f8platform', *arguments, '--exit-on-stdin-close'],
+                stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT,
+                start_new_session=os.name != 'nt',
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+            )
+
+        process = launch_process()
+        stopped = Event()
+        restarting = Event()
+        restart_lock = Lock()
+        menu_lock = Lock()
+        endpoints_stopped = Event()
+        endpoint_thread: Thread | None = None
+        monitor_thread: Thread | None = None
+        restart_thread: Thread | None = None
+        current_entries: tuple[TrayEndpoint, ...] = ()
         def open_page(address: str) -> None:
             try:
                 if not webbrowser.open(address):
@@ -97,6 +109,7 @@ def run_tray(*, arguments: list[str], url: str, data_dir: Path) -> None:
 
         def exit_platform() -> None:
             # Keep the UI callback nonblocking; the supervisor's finally owns cleanup.
+            stopped.set()
             icon.stop()
 
         def shortcut(entry: TrayEndpoint) -> pystray.MenuItem:
@@ -105,38 +118,92 @@ def run_tray(*, arguments: list[str], url: str, data_dir: Path) -> None:
                     open_page(entry.url)
             return pystray.MenuItem(entry.label, open_endpoint, enabled=entry.running)
 
-        def update_shortcuts(entries: tuple[TrayEndpoint, ...]) -> None:
-            icon.menu = pystray.Menu(
-                pystray.MenuItem('Manage extensions', open_platform, default=True),
-                *(shortcut(entry) for entry in entries),
-                pystray.MenuItem('Open console / logs', show_console),
-                pystray.MenuItem('Exit', exit_platform),
-            )
-            icon.update_menu()
+        def update_shortcuts(entries: tuple[TrayEndpoint, ...] | None) -> None:
+            nonlocal current_entries
+            with menu_lock:
+                if entries is not None:
+                    current_entries = entries
+                endpoints = pystray.Menu(*(shortcut(entry) for entry in current_entries)) if current_entries else pystray.Menu(
+                    pystray.MenuItem('No application endpoints', lambda: None, enabled=False),
+                )
+                icon.menu = pystray.Menu(
+                    pystray.MenuItem('Manage extensions', open_platform, default=True, enabled=not restarting.is_set()),
+                    pystray.MenuItem('Endpoints', endpoints, enabled=bool(current_entries) and not restarting.is_set()),
+                    pystray.MenuItem('Restarting Platform…' if restarting.is_set() else 'Restart Platform',
+                                     request_restart, enabled=not restarting.is_set()),
+                    pystray.MenuItem('Open console / logs', show_console),
+                    pystray.MenuItem('Exit', exit_platform),
+                )
+                icon.update_menu()
 
-        update_shortcuts(())
-        stopped = Event()
-        endpoint_thread: Thread | None = None
-
-        def monitor() -> None:
-            returncode = process.wait()
+        def monitor(monitored_process: subprocess.Popen[bytes]) -> None:
+            returncode = monitored_process.wait()
+            if stopped.is_set() or restarting.is_set() or monitored_process is not process:
+                return
             stopped.set()
             if returncode:
                 logger.error('Platform exited with code %s; log: %s', returncode, log_path)
                 show_console()
             icon.stop()
 
-        def setup(_tray_icon: object) -> None:
-            nonlocal endpoint_thread
-            icon.visible = True
+        def start_watchers() -> None:
+            nonlocal endpoint_thread, endpoints_stopped, monitor_thread
+            monitor_thread = Thread(target=monitor, args=(process,), name='platform-tray-monitor', daemon=True)
+            monitor_thread.start()
+            endpoints_stopped = Event()
             address = urlsplit(url)
             client = PlatformClient(PlatformConnection(url=f'{address.scheme}://{address.netloc}',
                 token_file=str(data_dir / 'platform-token')))
             client.http.timeout = httpx.Timeout(3.0)
-            endpoint_thread = Thread(target=watch_endpoints, args=(client, stopped, update_shortcuts),
+            endpoint_thread = Thread(target=watch_endpoints, args=(client, endpoints_stopped, update_shortcuts),
                                      name='platform-tray-endpoints', daemon=True)
             endpoint_thread.start()
-            Thread(target=monitor, name='platform-tray-monitor', daemon=True).start()
+
+        def restart_platform() -> None:
+            nonlocal process
+            failed = False
+            try:
+                endpoints_stopped.set()
+                if endpoint_thread is not None:
+                    endpoint_thread.join(timeout=7)
+                update_shortcuts(())
+                stop_process(process)
+                if monitor_thread is not None:
+                    monitor_thread.join()
+                if stopped.is_set():
+                    return
+                logger.info('Restarting Platform')
+                process = launch_process()
+                if not stopped.is_set():
+                    start_watchers()
+                logger.info('Platform replacement started with PID %s', process.pid)
+            except Exception:
+                # Restart runs at a background-thread boundary; keep the tray usable for retry.
+                failed = True
+                logger.exception('Failed to restart Platform; console log: %s', log_path)
+                show_console()
+            finally:
+                restarting.clear()
+                if not stopped.is_set():
+                    update_shortcuts(None)
+                    if not failed and process.poll() is not None:
+                        monitor(process)
+
+        def request_restart() -> None:
+            nonlocal restart_thread
+            with restart_lock:
+                if stopped.is_set() or restarting.is_set():
+                    return
+                restarting.set()
+                update_shortcuts(None)
+                restart_thread = Thread(target=restart_platform, name='platform-tray-restart', daemon=True)
+                restart_thread.start()
+
+        def setup(_tray_icon: object) -> None:
+            icon.visible = True
+            start_watchers()
+
+        update_shortcuts(())
 
         print(f'Platform tray is running. Console log: {log_path}', flush=True)
         previous_int = signal.getsignal(signal.SIGINT)
@@ -157,6 +224,11 @@ def run_tray(*, arguments: list[str], url: str, data_dir: Path) -> None:
             logger.info('Stopping Platform tray')
         finally:
             stopped.set()
+            endpoints_stopped.set()
+            if restart_thread is not None:
+                restart_thread.join()
+            # A restart may have created its new poller while shutdown was requested.
+            endpoints_stopped.set()
             if endpoint_thread is not None:
                 endpoint_thread.join(timeout=7)
             signal.signal(signal.SIGINT, previous_int)

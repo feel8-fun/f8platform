@@ -278,6 +278,16 @@ def create_app(data_dir: Path, *, startup: tuple[str, ...] = (), distribution: P
         job = runtime.submit_job(ManagementJobRequest(action='start-application', extension_id=extension_id))
         return Response(msgspec.json.encode(job), media_type='application/json', status_code=202)
 
+    @app.post('/api/source-applications/{extension_id}/restart', status_code=202)
+    async def restart_source(extension_id: str) -> Response:
+        job = get_runtime().submit_job(ManagementJobRequest(action='restart-source', extension_id=extension_id))
+        return Response(msgspec.json.encode(job), media_type='application/json', status_code=202)
+
+    @app.post('/api/applications/{extension_id}/restart', status_code=202)
+    async def restart(extension_id: str) -> Response:
+        job = get_runtime().submit_job(ManagementJobRequest(action='restart-application', extension_id=extension_id))
+        return Response(msgspec.json.encode(job), media_type='application/json', status_code=202)
+
     @app.post('/api/applications/{extension_id}/stop', status_code=202)
     async def stop(extension_id: str) -> Response:
         runtime = get_runtime()

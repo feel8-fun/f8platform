@@ -85,8 +85,14 @@ class PlatformRuntime:
             status = self.status(request.extension_id)
             if request.action == 'install-extension' and status.application and status.release_sha256 is None:
                 raise InvalidRequestError('This is a source checkout. Use Start source, or import a published release package.')
-            if request.action == 'start-source' and request.extension_id not in self.development.definitions:
+            if request.action in {'start-source', 'restart-source'} and request.extension_id not in self.development.definitions:
                 raise NotFoundError(f'Unknown source application: {request.extension_id}')
+            if request.action in {'restart-source', 'restart-application'}:
+                if not status.application or (status.running and not status.managed):
+                    raise ConflictError('This application is externally managed; restart it at its original entrypoint')
+                if request.action == 'restart-source' and request.extension_id in self.development.observed:
+                    raise ConflictError('This source application is externally managed; restart it at its original entrypoint')
+                self.development.require_dependents_stopped(request.extension_id)
         return self.jobs.submit(request)
 
     async def execute_management_job(self, request: ManagementJobRequest) -> None:
@@ -123,14 +129,20 @@ class PlatformRuntime:
                 await asyncio.to_thread(self.remove_environment, environment_id)
             case 'clean-unused-environments':
                 await self.clean_unused_environments()
-            case 'start-source':
+            case 'start-source' | 'restart-source':
                 assert extension_id is not None
+                await self.wait_application_stop(extension_id)
+                if request.action == 'restart-source':
+                    await self.development.stop(extension_id)
                 await self.development.start(extension_id)
-            case 'start-application':
+            case 'start-application' | 'restart-application':
                 assert extension_id is not None
+                await self.wait_application_stop(extension_id)
                 await self.development.probe_observed()
                 if any(item.extension_id == extension_id and item.state == 'running' for item in self.development.statuses()):
                     raise ConflictError('Stop the source application before starting an installed release')
+                if request.action == 'restart-application':
+                    await self.applications.stop(extension_id)
                 await self.applications.start(extension_id)
             case 'import-application':
                 assert request.location is not None and request.sha256 is not None
@@ -189,9 +201,9 @@ class PlatformRuntime:
             paths.append(self.data_dir / 'extensions/logs' / f'{job.request.extension_id}.log')
         elif job.request.action == 'prepare-environment':
             paths.append(self.extensions.runtime_registry.definitions / 'logs' / f'{job.request.environment_id}.log')
-        elif job.request.action == 'start-source':
+        elif job.request.action in {'start-source', 'restart-source'}:
             paths.append(self.data_dir / 'source-logs' / f'{job.request.extension_id}.log')
-        if job.request.action in {'install-extension', 'prepare-application', 'start-application', 'update-application'}:
+        if job.request.action in {'install-extension', 'prepare-application', 'start-application', 'restart-application', 'update-application'}:
             paths.append(self.data_dir / 'applications/logs' / f'{job.request.extension_id}.log')
         output: list[str] = []
         for path in paths:
@@ -300,6 +312,10 @@ class PlatformRuntime:
                      for status in statuses)
 
     def stop_application(self, extension_id: str, *, source: bool) -> ApplicationOperation:
+        if any(job.request.extension_id == extension_id and job.state in {'queued', 'running'} and
+               job.request.action in {'start-source', 'start-application', 'restart-source', 'restart-application'}
+               for job in self.jobs.list()):
+            raise ConflictError('An application start or restart is already queued or running')
         if source and extension_id not in self.development.definitions:
             raise NotFoundError(f'Unknown source application: {extension_id}')
         if source and extension_id in self.development.observed:
@@ -327,6 +343,14 @@ class PlatformRuntime:
                     'state': 'failed', 'detail': 'Application stop failed; see the platform console log.'})
         self.application_tasks[extension_id] = asyncio.create_task(stop(), name=f'stop-application:{extension_id}')
         return operation
+
+    async def wait_application_stop(self, extension_id: str) -> None:
+        previous = self.application_tasks.get(extension_id)
+        if previous is not None and not previous.done():
+            await previous
+            operation = self.application_operations[extension_id]
+            if operation.state == 'failed':
+                raise ConflictError(operation.detail)
 
     def status(self, extension_id: str) -> ExtensionStatus:
         status = next((item for item in self.statuses() if item.extension_id == extension_id), None)

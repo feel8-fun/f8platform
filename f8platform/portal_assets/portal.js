@@ -15,6 +15,7 @@ let taskPanelOpen = false;
 let toolHistoryClosed = false;
 let toolHistoryOpen = false;
 const dismissedTasks = new Set((localStorage.getItem('f8-maintenance-dismissed') || '').split('\n').filter(Boolean));
+let legacyTaskDismissals = dismissedTasks.size > 0;
 const dismissedTools = new Set((localStorage.getItem('f8-tool-dismissed') || '').split('\n').filter(Boolean));
 const activeJob = state => ['queued','running'].includes(state);
 function dismissRecords(key, dismissed, ids) {
@@ -45,6 +46,34 @@ async function api(path, method='GET', body, signal) {
   return response.status === 204 ? null : response.json();
 }
 function action(parent, label, run) { const btn = node('button',label); btn.onclick = async () => { btn.disabled = true; error.hidden = true; const revision=navigationRevision; try { await run(); } catch(reason) { if(revision===navigationRevision) fail(reason); } finally { btn.disabled = false; } }; parent.append(btn); return btn; }
+const actionIcons = {
+  start: ['m8 5 11 7-11 7Z'], stop: ['M6 6h12v12H6Z'],
+  restart: ['M3 11a9 9 0 1 1 2.4 7', 'M3 4v7h7'],
+  open: ['M15 3h6v6', 'm10 14 11-11', 'M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5'],
+  install: ['M12 3v12', 'm7 10 5 5 5-5', 'M5 16v4h14v-4'],
+  cancel: ['m6 6 12 12', 'M18 6 6 18'],
+  enable: ['m5 12 4 4L19 6'], disable: ['M4 4 20 20', 'M9 3h6l6 6v6l-6 6H9l-6-6V9Z'],
+  uninstall: ['M3 6h18', 'M9 6V3h6v3', 'm5 6 1 15h12l1-15', 'M10 10v7', 'M14 10v7'],
+  details: ['M12 11v6', 'M12 7h.01', 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0'],
+  logs: ['M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z', 'M14 2v6h6', 'M8 13h8', 'M8 17h6'],
+};
+function iconAction(parent, label, iconName, run, disabled=false) {
+  const button=action(parent,label,run);button.className='icon-action';button.title=label;
+  button.setAttribute('aria-label',label);button.disabled=disabled;
+  const icon=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  icon.setAttribute('viewBox','0 0 24 24');icon.setAttribute('fill','none');icon.setAttribute('stroke','currentColor');
+  icon.setAttribute('stroke-width','1.8');icon.setAttribute('stroke-linecap','round');icon.setAttribute('stroke-linejoin','round');icon.setAttribute('aria-hidden','true');
+  for(const data of actionIcons[iconName]) {const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d',data);icon.append(path);}
+  button.replaceChildren(icon);return button;
+}
+async function applicationAction(extensionId, source, command, buttons) {
+  for(const button of buttons.querySelectorAll('button'))button.disabled=true;
+  try {
+    const result=await api(`${source?'source-applications':'applications'}/${encodeURIComponent(extensionId)}/${command}`,'POST');
+    if(result.jobId) {managementJobs=[result,...managementJobs.filter(job=>job.jobId!==result.jobId)];renderTaskPanel();}
+    await load();
+  } catch(reason) {for(const button of buttons.querySelectorAll('button'))button.disabled=false;throw reason;}
+}
 function card(title, description) { const el = node('article',undefined,'card'); el.append(node('h2',title)); if(description) el.append(node('p',description,'meta')); return el; }
 function badge(parent,text) { parent.append(node('span',text,'badge '+text)); }
 function showDetail(title,value,jobId=null) { inspectedResource=null;inspectedJob=jobId;detailRevision++;detail.hidden=false; detail.replaceChildren(node('h2',title),node('pre',typeof value === 'string' ? value : JSON.stringify(value,null,2))); detailCloseButton();detail.scrollIntoView({behavior:'smooth',block:'nearest'}); }
@@ -59,6 +88,13 @@ async function inspect(title,path,jobId=null,format=value=>value) {
   }
 }
 function taskTitle(job) { return `${job.request.action.replaceAll('-', ' ')} · ${job.request.extensionId || job.request.environmentId || 'packages'}`; }
+async function clearTaskRecords(ids) {
+  const remaining=await api('management-jobs/clear-completed','POST',{jobIds:ids});
+  for(const id of ids)dismissedTasks.add(id);
+  managementJobs=remaining;
+  closeDetail();renderTaskPanel();
+  if(view==='tasks')await load();
+}
 function taskRows(parent,jobs) {
   for(const job of jobs) {
     const row=node('article',undefined,'row task-row');const summary=node('div');
@@ -69,14 +105,14 @@ function taskRows(parent,jobs) {
     action(buttons,'Task details / logs',()=>inspect(taskTitle(job),`management-jobs/${job.jobId}/logs`,null,logs=>logs.log || job.detail));
     if(['queued','running'].includes(job.state) && job.cancellable && !job.cancelRequested)
       action(buttons,'Cancel task',async()=>{await api(`management-jobs/${job.jobId}/cancel`,'POST');await pollTasks();});
-    if(!activeJob(job.state))action(buttons,'Dismiss',()=>{dismissRecords('f8-maintenance-dismissed',dismissedTasks,[job.jobId]);renderTaskPanel();if(view==='tasks')void load();});
+    if(!activeJob(job.state))action(buttons,'Dismiss',()=>clearTaskRecords([job.jobId]));
     parent.append(row);
   }
 }
 function renderTaskPanel() {
   const visible=managementJobs.filter(job=>activeJob(job.state) || !dismissedTasks.has(job.jobId));
   const active=visible.filter(job=>activeJob(job.state));
-  taskPanel.hidden=!managementJobs.length || view==='tasks';
+  taskPanel.hidden=!visible.length || view==='tasks';
   taskPanel.replaceChildren();
   if(taskPanelClosed) {action(taskPanel,`Show maintenance tasks · ${active.length} active`,()=>{taskPanelClosed=false;renderTaskPanel();});return;}
   const heading=node('div',undefined,'history-toolbar');taskPanel.append(heading);
@@ -89,7 +125,7 @@ function renderTaskPanel() {
 }
 function clearTasksButton(parent,jobs) {
   const completed=jobs.filter(job=>!activeJob(job.state));
-  const button=action(parent,'Clear completed',()=>{dismissRecords('f8-maintenance-dismissed',dismissedTasks,completed.map(job=>job.jobId));closeDetail();renderTaskPanel();if(view==='tasks')void load();});
+  const button=action(parent,'Clear completed',()=>clearTaskRecords(completed.map(job=>job.jobId)));
   button.disabled=!completed.length;
 }
 async function tasks(content) {
@@ -126,28 +162,38 @@ async function extensions(content,signal) {
       const label=node('label','Start with Launcher');const input=node('input');input.type='checkbox';input.checked=startup.applications.includes(item.extensionId);label.prepend(input);el.append(label);
       input.onchange=async()=>{input.disabled=true;try{const enabled=new Set(startup.applications);if(input.checked)enabled.add(item.extensionId);else enabled.delete(item.extensionId);const saved=await api('startup','PUT',{applications:[...enabled]});startup.applications=saved.applications;}catch(reason){input.checked=!input.checked;fail(reason);}finally{input.disabled=false;}};
     }
-    const buttons=node('div',undefined,'actions'); el.append(buttons);
+    const buttons=node('div',undefined,'actions extension-actions'); el.append(buttons);
+    const activeApplicationJob=managementJobs.find(job=>job.request.extensionId===item.extensionId && activeJob(job.state) &&
+      ['start-source','start-application','restart-source','restart-application'].includes(job.request.action));
+    const applicationBusy=Boolean(activeApplicationJob) || item.applicationOperation?.state==='running';
+    if(activeApplicationJob)badge(el,activeApplicationJob.request.action.startsWith('restart')?'restarting':activeApplicationJob.state);
     const source=sources.find(x=>x.extensionId === item.extensionId);
-    if(source && (source.managed || source.state !== 'running')) action(buttons,source.state === 'running' ? 'Stop source' : 'Start source', async()=>{await api(`source-applications/${item.extensionId}/${source.state === 'running' ? 'stop' : 'start'}`,'POST'); await load();});
+    if(source && (source.managed || source.state !== 'running')) {
+      iconAction(buttons,source.state==='running'?'Stop source':'Start source',source.state==='running'?'stop':'start',
+        ()=>applicationAction(item.extensionId,true,source.state==='running'?'stop':'start',buttons),applicationBusy);
+      if(source.state==='running')iconAction(buttons,'Restart source','restart',()=>applicationAction(item.extensionId,true,'restart',buttons),applicationBusy);
+    }
     const installed=apps.find(x=>x.manifest.extensionId === item.extensionId && x.selected);
     if(installed) {
-      action(buttons,installed.state === 'running' ? 'Stop' : 'Start',async()=>{await api(`applications/${item.extensionId}/${installed.state === 'running' ? 'stop' : 'start'}`,'POST');await load();});
-      if(installed.manifest.webAssets && item.running) action(buttons,'Open',()=>window.open(installed.endpoints.find(x=>x.name===installed.manifest.health.endpoint).url,'_blank','noopener'));
+      iconAction(buttons,installed.state==='running'?'Stop':'Start',installed.state==='running'?'stop':'start',
+        ()=>applicationAction(item.extensionId,false,installed.state==='running'?'stop':'start',buttons),applicationBusy);
+      if(installed.state==='running')iconAction(buttons,'Restart','restart',()=>applicationAction(item.extensionId,false,'restart',buttons),applicationBusy);
+      if(installed.manifest.webAssets && installed.state==='running')iconAction(buttons,'Open','open',()=>window.open(installed.endpoints.find(x=>x.name===installed.manifest.health.endpoint).url,'_blank','noopener'));
     }
     if(source?.state === 'running') {
       const def=source.endpoints.find(x=>x.name==='http') || source.endpoints[0];
-      if(def) action(buttons,'Open',()=>window.open(def.url,'_blank','noopener'));
+      if(def)iconAction(buttons,'Open','open',()=>window.open(def.url,'_blank','noopener'));
     }
     if(!item.application || item.releaseSha256) {
-      if(item.state === 'available' || item.state === 'failed') action(buttons,'Install',async()=>{await api(`extensions/${item.extensionId}/install`,'POST');await load();});
-      if(item.state === 'installing') action(buttons,'Cancel installation',async()=>{await api(`extensions/${item.extensionId}/cancel`,'POST');await load();});
+      if(item.state === 'available' || item.state === 'failed')iconAction(buttons,'Install','install',async()=>{await api(`extensions/${item.extensionId}/install`,'POST');await load();});
+      if(item.state === 'installing')iconAction(buttons,'Cancel installation','cancel',async()=>{await api(`extensions/${item.extensionId}/cancel`,'POST');await load();});
       if(['installed','disabled'].includes(item.state)) {
-        action(buttons,item.state === 'installed' ? 'Disable' : 'Enable',async()=>{await api(`extensions/${item.extensionId}/enabled`,'PUT',{enabled:item.state!=='installed'});await load();});
-        action(buttons,'Uninstall',async()=>{await api(`extensions/${item.extensionId}`,'DELETE');await load();});
+        iconAction(buttons,item.state === 'installed' ? 'Disable' : 'Enable',item.state==='installed'?'disable':'enable',async()=>{await api(`extensions/${item.extensionId}/enabled`,'PUT',{enabled:item.state!=='installed'});await load();},applicationBusy);
+        iconAction(buttons,'Uninstall','uninstall',async()=>{await api(`extensions/${item.extensionId}`,'DELETE');await load();},applicationBusy);
       }
     }
-    action(buttons,'Details',()=>inspect(item.name,`extensions/${item.extensionId}/detail`));
-    if(item.application) action(buttons,'Logs',()=>inspect(item.name+' logs',`application-logs/${item.extensionId}`));
+    iconAction(buttons,'Details','details',()=>inspect(item.name,`extensions/${item.extensionId}/detail`));
+    if(item.application)iconAction(buttons,'Logs','logs',()=>inspect(item.name+' logs',`application-logs/${item.extensionId}`));
   }
   if(!items.length) content.append(node('p','No extensions installed. Add a release package below.','empty'));
   const form=node('form'); form.append(node('h3','Add extension package'));
@@ -315,7 +361,12 @@ async function pollTasks(refreshView=true) {
   pollingTasks=true;
   const navigation=navigationRevision;
   try {
-    const jobs=await api('management-jobs');
+    let jobs=await api('management-jobs');
+    if(legacyTaskDismissals) {
+      const ids=jobs.filter(job=>!activeJob(job.state) && dismissedTasks.has(job.jobId)).map(job=>job.jobId);
+      if(ids.length)jobs=await api('management-jobs/clear-completed','POST',{jobIds:ids});
+      localStorage.removeItem('f8-maintenance-dismissed');dismissedTasks.clear();legacyTaskDismissals=false;
+    }
     const signature=JSON.stringify(jobs);
     const states=JSON.stringify(jobs.map(job=>[job.jobId,job.state]));
     const changed=statesSignature!==states;

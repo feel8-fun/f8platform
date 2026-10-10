@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from pathlib import Path
 import sys
 import time
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 import httpx
@@ -21,7 +22,11 @@ from f8pysdk.platform_client import PlatformClient, PlatformConnection
 from f8pysdk.platform_spec import DevelopmentCatalog
 from f8pysdk.tool_spec import ToolRunRequest
 
-from test_applications import artifact
+from test_applications import artifact, FIXTURE_SERVER, free_port
+from f8platform.runtime import PlatformRuntime
+from f8pysdk.platform_spec import DevelopmentApplication
+from f8pysdk.application_package import read_application
+from f8pysdk.management_job import ManagementJobRequest
 
 
 def wait_job(client: TestClient, headers: dict[str, str], response: httpx.Response, expected: str = 'succeeded') -> dict[str, object]:
@@ -35,6 +40,121 @@ def wait_job(client: TestClient, headers: dict[str, str], response: httpx.Respon
             return job
         assert time.monotonic() < deadline, job
         time.sleep(0.01)
+
+
+def test_clear_completed_api_removes_only_requested_records_across_restart(tmp_path: Path) -> None:
+    app = create_app(tmp_path)
+    headers = {'Authorization': f'Bearer {access_token(tmp_path)}'}
+    endpoint = '/api/management-jobs/clear-completed'
+    with TestClient(app) as client:
+        runtime: PlatformRuntime = app.state.platform
+        with patch.object(runtime, 'execute_job', new_callable=AsyncMock):
+            succeeded = wait_job(client, headers, client.post('/api/environments/unused/clean', headers=headers))
+        with patch.object(runtime, 'execute_job', new_callable=AsyncMock, side_effect=ValueError('Fixture failure')):
+            failed = wait_job(client, headers, client.post('/api/environments/unused/clean', headers=headers), 'failed')
+        request = {'jobIds': [failed['jobId']]}
+        assert client.post(endpoint, json=request).status_code == 401
+        assert client.post(endpoint, headers=headers, json={'jobIds': 'invalid'}).status_code == 422
+        sdk = sdk_client(tmp_path, client)
+        try:
+            assert [job.job_id for job in sdk.jobs.clear_completed((str(failed['jobId']),))] == [succeeded['jobId']]
+            assert [job.job_id for job in sdk.jobs.clear_completed((str(failed['jobId']),))] == [succeeded['jobId']]
+        finally:
+            sdk.close()
+        assert client.get(f"/api/management-jobs/{failed['jobId']}", headers=headers).status_code == 404
+    with TestClient(create_app(tmp_path)) as restarted:
+        assert [job['jobId'] for job in restarted.get('/api/management-jobs', headers=headers).json()] == [succeeded['jobId']]
+        assert restarted.post(endpoint, headers=headers, json={'jobIds': [succeeded['jobId']]}).json() == []
+
+
+@pytest.mark.parametrize('source', [False, True])
+def test_restart_api_replaces_the_process_and_waits_for_health(tmp_path: Path, source: bool) -> None:
+    server_code = FIXTURE_SERVER.replace(
+        "http.server.HTTPServer(('127.0.0.1', int(port)), Handler).serve_forever()",
+        "server = http.server.HTTPServer(('127.0.0.1', int(port)), Handler)\n"
+        "import threading\n"
+        "threading.Thread(target=lambda: (sys.stdin.read(), server.shutdown()), daemon=True).start()\n"
+        "server.serve_forever()",
+    )
+    archive, digest = artifact(tmp_path, 'restartable', port=free_port())
+    payload = tmp_path / 'restartable-1.0'
+    manifest = read_application(payload)
+    definitions = tmp_path / 'development.json'
+    definitions.write_bytes(msgspec.json.encode(DevelopmentCatalog(applications=(DevelopmentApplication(
+        manifest=manifest, runtime_manifest=str(payload / 'workspace/pixi.toml'), workdir=str(payload),
+        arguments=('-c', server_code, *manifest.launch.args),
+    ),))))
+    data = tmp_path / 'data'
+    app = create_app(data, source_index=payload / 'config/service-index.json' if source else None,
+                     development=definitions if source else None)
+    with TestClient(app) as client, patch.object(EnvironmentManager, 'ready', return_value=True), \
+         patch.object(EnvironmentManager, 'python_launch', return_value=(sys.executable, ['-c', server_code])):
+        runtime: PlatformRuntime = app.state.platform
+        headers = {'Authorization': f'Bearer {access_token(data)}'}
+        prefix = 'source-applications' if source else 'applications'
+        if not source:
+            runtime.applications.import_local_archive(str(archive), digest)
+            wait_job(client, headers, client.post('/api/applications/restartable/select', headers=headers, json={'sha256': digest}))
+        with patch.object(runtime.development, '_prepare_runtime', new_callable=AsyncMock, return_value=(sys.executable, [])):
+            wait_job(client, headers, client.post(f'/api/{prefix}/restartable/start', headers=headers))
+            before = runtime.development.running['restartable'] if source else runtime.applications.running['restartable']
+            job = wait_job(client, headers, client.post(f'/api/{prefix}/restartable/restart', headers=headers))
+            after = runtime.development.running['restartable'] if source else runtime.applications.running['restartable']
+            assert before.process.returncode is not None
+            assert after.process.pid != before.process.pid
+            assert after.process.returncode is None
+            status = client.get('/api/extensions', headers=headers).json()[0]
+            assert status['running'] and status['managed']
+            assert job['request']['action'] == ('restart-source' if source else 'restart-application')
+            assert status['version'] == '1.0'
+            if not source:
+                assert runtime.applications.state.selected['restartable'] == digest
+
+
+def test_restart_waits_for_pending_stop_and_does_not_start_after_stop_failure(tmp_path: Path) -> None:
+    async def run() -> None:
+        artifact(tmp_path, 'source')
+        definitions = tmp_path / 'development.json'
+        definitions.write_bytes(msgspec.json.encode(DevelopmentCatalog(applications=(DevelopmentApplication(
+            manifest=read_application(tmp_path / 'source-1.0'), runtime_manifest='unused', workdir=str(tmp_path), arguments=(),
+        ),))))
+        runtime = PlatformRuntime(tmp_path / 'data', source_index=tmp_path / 'source-1.0/config/service-index.json', development=definitions)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed_stop(_identifier: str) -> None:
+            entered.set()
+            await release.wait()
+
+        try:
+            with patch.object(runtime.development, 'stop', side_effect=delayed_stop) as stop, \
+                 patch.object(runtime.development, 'start', new_callable=AsyncMock) as start:
+                runtime.stop_application('source', source=True)
+                await entered.wait()
+                job = runtime.submit_job(ManagementJobRequest(action='restart-source', extension_id='source'))
+                await asyncio.sleep(0)
+                start.assert_not_awaited()
+                assert stop.await_count == 1
+                with pytest.raises(RuntimeError, match='already queued or running'):
+                    runtime.stop_application('source', source=True)
+                release.set()
+                while runtime.jobs.get(job.job_id).state in {'queued', 'running'}:
+                    await asyncio.sleep(0)
+                assert runtime.jobs.get(job.job_id).state == 'succeeded'
+                start.assert_awaited_once_with('source')
+            with (patch.object(runtime.development, 'stop', new_callable=AsyncMock, side_effect=OSError('Cannot release process')),
+                  patch.object(runtime.development, 'start', new_callable=AsyncMock) as start):
+                job = runtime.submit_job(ManagementJobRequest(action='restart-source', extension_id='source'))
+                while runtime.jobs.get(job.job_id).state in {'queued', 'running'}:
+                    await asyncio.sleep(0)
+                assert runtime.jobs.get(job.job_id).state == 'failed'
+                assert 'Cannot release process' in runtime.jobs.get(job.job_id).detail
+                assert 'OSError' in runtime.job_log(job.job_id).log
+                start.assert_not_awaited()
+        finally:
+            release.set()
+            await runtime.close()
+
+    asyncio.run(run())
 
 
 def test_source_dependency_prefers_compatible_configured_release(tmp_path: Path) -> None:
@@ -372,5 +492,7 @@ def test_manual_source_execution_is_not_an_installed_release(tmp_path: Path) -> 
         assert client.get('/api/applications',headers=headers).json()==[]
         assert client.post('/api/extensions/source/install',headers=headers).status_code==400
         assert client.post('/api/source-applications/source/stop',headers=headers).status_code==409
+        assert client.post('/api/source-applications/source/restart',headers=headers).status_code==409
+        assert client.post('/api/applications/source/restart',headers=headers).status_code==409
         alive=False
         assert not client.get('/api/extensions',headers=headers).json()[0]['running']

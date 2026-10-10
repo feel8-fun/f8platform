@@ -62,6 +62,18 @@ class ManagementJobs:
     def list(self) -> tuple[ManagementJob, ...]:
         return tuple(self.get(job.job_id) for job in sorted(self._jobs.values(), key=lambda item: item.created_at, reverse=True))
 
+    def clear_completed(self, identifiers: tuple[str, ...]) -> tuple[ManagementJob, ...]:
+        jobs = tuple(self._jobs[identifier] for identifier in dict.fromkeys(identifiers) if identifier in self._jobs)
+        for job in jobs:
+            if job.state in {'queued', 'running'}:
+                raise ConflictError(f'Cannot clear an active management task: {job.job_id}')
+        for job in jobs:
+            # Remove the record last so a log cleanup failure leaves it available for retry.
+            (self.root / f'{job.job_id}.log').unlink(missing_ok=True)
+            (self.root / f'{job.job_id}.json').unlink(missing_ok=True)
+            del self._jobs[job.job_id]
+        return self.list()
+
     def submit(self, request: ManagementJobRequest) -> ManagementJob:
         if self._closing:
             raise ConflictError('Platform is shutting down')
@@ -90,8 +102,8 @@ class ManagementJobs:
     async def _run(self) -> None:
         while self._pending:
             identifier = self._pending.popleft()
-            job = self._jobs[identifier]
-            if job.state != 'queued':
+            job = self._jobs.get(identifier)
+            if job is None or job.state != 'queued':
                 continue
             self._save(copy_model(job, update={'state': 'running', 'started_at': time.time(),
                 'detail': 'Executing task', 'cancellable': False}))
@@ -128,16 +140,19 @@ class ManagementJobs:
 
     async def _cancel_running(self, identifier: str) -> None:
         try:
-            while self._jobs[identifier].state == 'running':
-                if await self.cancel_operation(self._jobs[identifier].request):
+            job = self._jobs.get(identifier)
+            while job is not None and job.state == 'running':
+                if await self.cancel_operation(job.request):
                     return
                 # Submission may be cancelled before its installer subprocess is created.
                 await asyncio.sleep(0.05)
+                job = self._jobs.get(identifier)
         except Exception:
             logger.exception('Cannot cancel management task %s', identifier)
-            current = self._jobs[identifier]
-            self._save(copy_model(current, update={'cancel_requested': False,
-                'detail': 'Cancellation failed; see the platform console log.'}))
+            current = self._jobs.get(identifier)
+            if current is not None:
+                self._save(copy_model(current, update={'cancel_requested': False,
+                    'detail': 'Cancellation failed; see the platform console log.'}))
 
     async def close(self) -> None:
         self._closing = True
