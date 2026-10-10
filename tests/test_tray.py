@@ -342,7 +342,7 @@ def test_tray_restarts_a_real_daemon_without_exiting(tmp_path: Path) -> None:
                 assert child.poll() is None, (tmp_path / 'platform-console.log').read_text()
                 try:
                     response = client.get('/api/health')
-                except httpx.ConnectError:
+                except (httpx.ConnectError, httpx.ConnectTimeout):
                     time.sleep(0.02)
                     continue
                 if response.is_success and icon.menu[2][0] == 'Restart Platform':
